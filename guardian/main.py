@@ -1,11 +1,16 @@
 """Entry point: read a GitHub Actions pull_request event, analyze the PR's
-changed files, and upsert PR Guardian's summary comment.
+changed files, check it for merge conflicts and file overlap against
+other open PRs, and upsert PR Guardian's summary comment and check run.
 
 Ground rules (see CLAUDE.md for the full list):
-- Warn-only: this never fails the run, even when a PR is flagged.
+- Warn-only: this never fails the run, even when a PR is flagged. The
+  check run conclusion is always "neutral", never "failure".
 - Untrusted input: file paths and existing comment bodies are the only
   GitHub-sourced data used, and only ever as data — never as instructions.
 - One comment per PR: always upsert via the HTML marker in report.py.
+- Phase 2 (merge conflicts / overlap) is best-effort on top of Phase 1:
+  if listing open PRs or the git operations in merge_check.py fail
+  outright, the contract-file comment from Phase 1 still gets posted.
 """
 
 from __future__ import annotations
@@ -19,7 +24,9 @@ import requests
 
 from guardian.contracts import analyze
 from guardian.github_client import GitHubClient
-from guardian.report import build_comment, find_existing_comment
+from guardian.merge_check import run_merge_checks
+from guardian.overlap import find_overlaps
+from guardian.report import CHECK_RUN_NAME, build_check_run_summary, build_comment, find_existing_comment
 
 
 def _load_event(event_path: str) -> dict:
@@ -34,11 +41,36 @@ def _pr_number_from_event(event: dict) -> int | None:
     return event.get("number")
 
 
-def run(pr_number: int, repo: str, token: str) -> None:
+def _base_ref_from_event(event: dict) -> str | None:
+    pr = event.get("pull_request")
+    if not pr:
+        return None
+    return (pr.get("base") or {}).get("ref")
+
+
+def _head_sha_from_event(event: dict) -> str | None:
+    pr = event.get("pull_request")
+    if not pr:
+        return None
+    return (pr.get("head") or {}).get("sha")
+
+
+def run(
+    pr_number: int,
+    repo: str,
+    token: str,
+    *,
+    repo_path: str = ".",
+    base_ref: str | None = None,
+    head_sha: str | None = None,
+) -> None:
     client = GitHubClient(token=token, repo=repo)
     files = client.list_pr_files(pr_number)
     result = analyze(files)
-    body = build_comment(result)
+
+    merge_report, overlaps = _run_phase2_checks(client, pr_number, files, repo_path, base_ref)
+
+    body = build_comment(result, merge_report=merge_report, overlaps=overlaps)
 
     try:
         comments = client.list_issue_comments(pr_number)
@@ -49,6 +81,55 @@ def run(pr_number: int, repo: str, token: str) -> None:
             client.create_comment(pr_number, body)
     except requests.exceptions.HTTPError as exc:
         _handle_comment_post_failure(exc, body)
+
+    if head_sha:
+        _publish_check_run(client, head_sha, result, merge_report, overlaps)
+
+
+def _run_phase2_checks(client, pr_number, files, repo_path, base_ref):
+    """Merge-conflict and file-overlap checks against main and other open
+    PRs. Best-effort: Phase 1's contract-file comment must still get
+    posted even if listing open PRs or the underlying git operations
+    fail outright, so any unexpected failure here is logged and swallowed
+    rather than propagated -- this is on top of the per-comparison
+    degrading run_merge_checks already does for one bad PR or ref."""
+    if not base_ref:
+        return None, None
+
+    try:
+        other_prs = [p for p in client.list_open_prs() if p["number"] != pr_number]
+        other_pr_files = [(p["number"], p["title"], client.list_pr_files(p["number"])) for p in other_prs]
+        overlaps = find_overlaps(files, other_pr_files)
+
+        merge_report = run_merge_checks(
+            repo_path=repo_path,
+            remote="origin",
+            this_pr_number=pr_number,
+            base_branch=base_ref,
+            other_prs=[(p["number"], p["title"]) for p in other_prs],
+        )
+        return merge_report, overlaps
+    except Exception as exc:  # noqa: BLE001 - Phase 2 is best-effort, never blocks Phase 1
+        print(
+            f"PR Guardian: Phase 2 checks (merge conflicts / overlap) failed "
+            f"({exc}); posting the contract-file report only.",
+            file=sys.stderr,
+        )
+        return None, None
+
+
+def _publish_check_run(client, head_sha: str, result, merge_report, overlaps) -> None:
+    title, summary = build_check_run_summary(result, merge_report=merge_report, overlaps=overlaps)
+    try:
+        existing = client.find_check_run(head_sha, CHECK_RUN_NAME)
+        if existing:
+            client.update_check_run(existing["id"], title, summary, conclusion="neutral")
+        else:
+            client.create_check_run(head_sha, CHECK_RUN_NAME, title, summary, conclusion="neutral")
+    except requests.exceptions.HTTPError as exc:
+        # Never fail the run over the check run alone -- the PR comment above
+        # already carries the same information.
+        print(f"PR Guardian: could not publish check run ({exc}).", file=sys.stderr)
 
 
 def _handle_comment_post_failure(exc: requests.exceptions.HTTPError, body: str) -> None:
@@ -132,7 +213,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        run(pr_number, repo, token)
+        run(
+            pr_number,
+            repo,
+            token,
+            base_ref=_base_ref_from_event(event),
+            head_sha=_head_sha_from_event(event),
+        )
     except Exception as exc:  # noqa: BLE001 - warn-only, never fail the run
         print(f"PR Guardian encountered an error (warn-only, not failing): {exc}", file=sys.stderr)
         _write_step_summary(

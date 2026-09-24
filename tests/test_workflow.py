@@ -31,4 +31,18 @@ def test_workflow_cancels_in_progress_runs():
 
 def test_workflow_still_has_minimal_permissions():
     workflow = _load_workflow()
-    assert workflow["permissions"] == {"contents": "read", "pull-requests": "write"}
+    assert workflow["permissions"] == {
+        "contents": "read",
+        "pull-requests": "write",
+        "checks": "write",
+    }
+
+
+def test_workflow_checkout_has_full_history_for_merge_tree():
+    # git merge-tree computes its own merge base by walking commit
+    # history; a shallow clone can leave no common ancestor at all,
+    # which merge-tree reports as "refusing to merge unrelated histories".
+    workflow = _load_workflow()
+    steps = workflow["jobs"]["guardian"]["steps"]
+    checkout_step = next(s for s in steps if s.get("uses", "").startswith("actions/checkout"))
+    assert checkout_step.get("with", {}).get("fetch-depth") == 0

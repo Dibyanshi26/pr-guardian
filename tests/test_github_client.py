@@ -139,3 +139,118 @@ def test_create_comment_raises_on_http_error(monkeypatch):
         assert False, "expected HTTPError"
     except requests.exceptions.HTTPError as exc:
         assert exc.response.status_code == 403
+
+
+# --- list_open_prs ---
+
+
+def test_list_open_prs_maps_expected_fields(monkeypatch):
+    client = _client()
+    prs = [
+        {"number": 1, "title": "add feature", "head": {"sha": "abc123", "ref": "feature-branch"}},
+    ]
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(prs)))
+
+    result = client.list_open_prs()
+
+    assert result == [{"number": 1, "title": "add feature", "head_sha": "abc123", "head_ref": "feature-branch"}]
+
+
+def test_list_open_prs_follows_link_header_across_pages(monkeypatch):
+    client = _client()
+    page1 = [
+        {"number": i, "title": f"pr {i}", "head": {"sha": f"sha{i}", "ref": f"branch{i}"}} for i in range(100)
+    ]
+    page2 = [
+        {"number": i, "title": f"pr {i}", "head": {"sha": f"sha{i}", "ref": f"branch{i}"}}
+        for i in range(100, 110)
+    ]
+    page1_url = "https://api.github.com/repos/acme/widgets/pulls"
+    page2_url = f"{page1_url}?page=2"
+    mock_get = Mock(
+        side_effect=[
+            _make_response(page1, next_url=page2_url),
+            _make_response(page2),
+        ]
+    )
+    monkeypatch.setattr(client.session, "get", mock_get)
+
+    result = client.list_open_prs()
+
+    assert len(result) == 110
+    assert mock_get.call_count == 2
+
+
+# --- check runs ---
+
+
+def test_find_check_run_returns_matching_run_by_name(monkeypatch):
+    client = _client()
+    payload = {
+        "check_runs": [
+            {"id": 1, "name": "Some Other Check"},
+            {"id": 2, "name": "PR Guardian"},
+        ]
+    }
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(payload)))
+
+    result = client.find_check_run("sha123", "PR Guardian")
+
+    assert result == {"id": 2, "name": "PR Guardian"}
+
+
+def test_find_check_run_returns_none_when_absent(monkeypatch):
+    client = _client()
+    payload = {"check_runs": [{"id": 1, "name": "Some Other Check"}]}
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(payload)))
+
+    assert client.find_check_run("sha123", "PR Guardian") is None
+
+
+def test_find_check_run_follows_link_header_across_pages(monkeypatch):
+    client = _client()
+    page1_url = "https://api.github.com/repos/acme/widgets/commits/sha123/check-runs"
+    page2_url = f"{page1_url}?page=2"
+    page1 = {"check_runs": [{"id": 1, "name": "Some Other Check"}]}
+    page2 = {"check_runs": [{"id": 2, "name": "PR Guardian"}]}
+    mock_get = Mock(
+        side_effect=[
+            _make_response(page1, next_url=page2_url),
+            _make_response(page2),
+        ]
+    )
+    monkeypatch.setattr(client.session, "get", mock_get)
+
+    result = client.find_check_run("sha123", "PR Guardian")
+
+    assert result == {"id": 2, "name": "PR Guardian"}
+    assert mock_get.call_count == 2
+
+
+def test_create_check_run_posts_expected_payload(monkeypatch):
+    client = _client()
+    mock_post = Mock(return_value=_make_response({"id": 5}))
+    monkeypatch.setattr(client.session, "post", mock_post)
+
+    result = client.create_check_run("sha123", "PR Guardian", "title", "summary", conclusion="neutral")
+
+    assert result["id"] == 5
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["head_sha"] == "sha123"
+    assert payload["name"] == "PR Guardian"
+    assert payload["status"] == "completed"
+    assert payload["conclusion"] == "neutral"
+    assert payload["output"] == {"title": "title", "summary": "summary"}
+
+
+def test_update_check_run_patches_expected_payload(monkeypatch):
+    client = _client()
+    mock_patch = Mock(return_value=_make_response({"id": 5}))
+    monkeypatch.setattr(client.session, "patch", mock_patch)
+
+    client.update_check_run(5, "title", "summary", conclusion="neutral")
+
+    payload = mock_patch.call_args.kwargs["json"]
+    assert payload["conclusion"] == "neutral"
+    assert payload["output"] == {"title": "title", "summary": "summary"}
+    assert "/check-runs/5" in mock_patch.call_args.args[0]

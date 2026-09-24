@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: write
 
 concurrency:
   group: pr-guardian-${{ github.event.pull_request.number }}
@@ -18,6 +19,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Phase 2's merge-conflict check needs full history: git
+          # merge-tree computes its own merge base by walking commit
+          # history, and a shallow clone can leave it with no common
+          # ancestor at all ("refusing to merge unrelated histories").
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -25,19 +25,31 @@ class FakeClient:
         list_files_error=None,
         create_error=None,
         update_error=None,
+        files_by_pr=None,
+        open_prs=None,
+        list_open_prs_error=None,
+        existing_check_run=None,
+        create_check_run_error=None,
     ):
         self._files = files or []
         self._comments = comments or []
         self._list_files_error = list_files_error
         self._create_error = create_error
         self._update_error = update_error
+        self._files_by_pr = files_by_pr or {}
+        self._open_prs = open_prs or []
+        self._list_open_prs_error = list_open_prs_error
+        self._existing_check_run = existing_check_run
+        self._create_check_run_error = create_check_run_error
         self.created = []
         self.updated = []
+        self.created_check_runs = []
+        self.updated_check_runs = []
 
     def list_pr_files(self, pr_number):
         if self._list_files_error:
             raise self._list_files_error
-        return self._files
+        return self._files_by_pr.get(pr_number, self._files)
 
     def list_issue_comments(self, pr_number):
         return self._comments
@@ -51,6 +63,32 @@ class FakeClient:
         if self._update_error:
             raise self._update_error
         self.updated.append(body)
+
+    def list_open_prs(self):
+        if self._list_open_prs_error:
+            raise self._list_open_prs_error
+        return self._open_prs
+
+    def find_check_run(self, head_sha, name):
+        return self._existing_check_run
+
+    def create_check_run(self, head_sha, name, title, summary, conclusion):
+        if self._create_check_run_error:
+            raise self._create_check_run_error
+        call = {
+            "head_sha": head_sha,
+            "name": name,
+            "title": title,
+            "summary": summary,
+            "conclusion": conclusion,
+        }
+        self.created_check_runs.append(call)
+        return {"id": 555, **call}
+
+    def update_check_run(self, check_run_id, title, summary, conclusion):
+        call = {"check_run_id": check_run_id, "title": title, "summary": summary, "conclusion": conclusion}
+        self.updated_check_runs.append(call)
+        return {"id": check_run_id, **call}
 
 
 def _patch_client(monkeypatch, fake_client):
@@ -185,3 +223,204 @@ def test_second_run_updates_existing_comment_instead_of_creating_a_new_one(monke
     main_module.run(pr_number=1, repo="acme/widgets", token="x")
     assert len(fake_client.created) == 1  # unchanged
     assert len(fake_client.updated) == 1
+
+
+# --- Phase 2: merge conflicts + overlap, only engaged when base_ref/head_sha
+# are supplied (production always supplies them; existing tests above,
+# which don't, exercise the Phase-1-only path unchanged) ---
+
+
+def _fake_merge_report(**overrides):
+    from guardian.merge_check import MergeCheckReport, MergeCheckResult
+
+    defaults = dict(against_base=MergeCheckResult(label="main", conflicted=False), against_other_prs=[])
+    defaults.update(overrides)
+    return MergeCheckReport(**defaults)
+
+
+def test_phase2_merge_overlap_checks_skipped_without_base_ref(monkeypatch):
+    # base_ref is required to know what to fetch/compare against; without
+    # it, merge-conflict and overlap checks are skipped entirely. A check
+    # run is still published, though -- it only needs head_sha, and can
+    # carry the Phase 1 contract-only result on its own.
+    fake_client = FakeClient(files=["src/app.py"])
+    _patch_client(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        main_module,
+        "run_merge_checks",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", head_sha="abc123")
+
+    assert "### Merge conflicts" not in fake_client.created[0]
+    assert "### Overlapping PRs" not in fake_client.created[0]
+    assert len(fake_client.created_check_runs) == 1
+
+
+def test_full_phase2_flow_extends_comment_with_both_new_sections(monkeypatch):
+    fake_client = FakeClient(
+        files=["src/app.py"],
+        files_by_pr={2: ["src/app.py"]},
+        open_prs=[{"number": 2, "title": "also touches app.py", "head_sha": "s2", "head_ref": "b2"}],
+    )
+    _patch_client(monkeypatch, fake_client)
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: _fake_merge_report())
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    body = fake_client.created[0]
+    assert "### Merge conflicts" in body
+    assert "### Overlapping PRs" in body
+    assert "PR #2" in body
+    assert "src/app.py" in body
+
+
+def test_phase2_excludes_this_pr_from_the_other_prs_list(monkeypatch):
+    fake_client = FakeClient(
+        files=["src/app.py"],
+        open_prs=[{"number": 1, "title": "this pr itself", "head_sha": "abc123", "head_ref": "b1"}],
+    )
+    _patch_client(monkeypatch, fake_client)
+    captured = {}
+
+    def fake_run_merge_checks(**kwargs):
+        captured.update(kwargs)
+        return _fake_merge_report()
+
+    monkeypatch.setattr(main_module, "run_merge_checks", fake_run_merge_checks)
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    assert captured["other_prs"] == []
+
+
+def test_phase2_failure_degrades_to_phase1_only_comment(monkeypatch):
+    fake_client = FakeClient(files=["src/app.py"], list_open_prs_error=RuntimeError("API down"))
+    _patch_client(monkeypatch, fake_client)
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    body = fake_client.created[0]
+    assert "### Merge conflicts" not in body
+    assert "### Overlapping PRs" not in body
+
+
+def test_phase2_run_merge_checks_error_result_for_one_pr_does_not_crash_the_run(monkeypatch):
+    # Mirrors run_merge_checks' own per-comparison degrade (deleted
+    # branch, permissions) as seen from main.py's orchestration side.
+    from guardian.merge_check import MergeCheckResult
+
+    fake_client = FakeClient(
+        files=["src/app.py"],
+        open_prs=[{"number": 2, "title": "deleted branch pr", "head_sha": "s2", "head_ref": "b2"}],
+    )
+    _patch_client(monkeypatch, fake_client)
+    degraded_report = _fake_merge_report(
+        against_other_prs=[MergeCheckResult(label="deleted branch pr", conflicted=False, error="branch deleted", pr_number=2)]
+    )
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: degraded_report)
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    body = fake_client.created[0]
+    assert "could not check" in body
+    assert "branch deleted" in body
+
+
+# --- Check run publishing ---
+
+
+def test_check_run_created_with_neutral_conclusion(monkeypatch):
+    fake_client = FakeClient(files=["src/app.py"])
+    _patch_client(monkeypatch, fake_client)
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: _fake_merge_report())
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    assert len(fake_client.created_check_runs) == 1
+    assert fake_client.created_check_runs[0]["conclusion"] == "neutral"
+    assert fake_client.created_check_runs[0]["head_sha"] == "abc123"
+
+
+def test_check_run_never_created_with_failure_conclusion(monkeypatch):
+    # Regression guard for the warn-only rule: no code path may pass
+    # "failure" as the check run conclusion in Phase 1 or Phase 2.
+    from guardian.merge_check import MergeCheckResult
+
+    fake_client = FakeClient(files=["migrations/0001.sql"])
+    _patch_client(monkeypatch, fake_client)
+    merge_report = _fake_merge_report(
+        against_base=MergeCheckResult(label="main", conflicted=True, conflicting_files=["f.py"])
+    )
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: merge_report)
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    for call in fake_client.created_check_runs + fake_client.updated_check_runs:
+        assert call["conclusion"] == "neutral"
+
+
+def test_check_run_updates_existing_run_instead_of_creating_a_new_one(monkeypatch):
+    fake_client = FakeClient(files=["src/app.py"], existing_check_run={"id": 777})
+    _patch_client(monkeypatch, fake_client)
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: _fake_merge_report())
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")
+
+    assert fake_client.created_check_runs == []
+    assert len(fake_client.updated_check_runs) == 1
+    assert fake_client.updated_check_runs[0]["check_run_id"] == 777
+
+
+def test_check_run_not_published_without_head_sha(monkeypatch):
+    fake_client = FakeClient(files=["src/app.py"])
+    _patch_client(monkeypatch, fake_client)
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main")
+
+    assert fake_client.created_check_runs == []
+    assert fake_client.updated_check_runs == []
+
+
+def test_check_run_publish_failure_does_not_raise(monkeypatch):
+    fake_client = FakeClient(
+        files=["src/app.py"],
+        create_check_run_error=_http_error(500),
+    )
+    _patch_client(monkeypatch, fake_client)
+    monkeypatch.setattr(main_module, "run_merge_checks", lambda **kwargs: _fake_merge_report())
+
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", base_ref="main", head_sha="abc123")  # must not raise
+
+
+# --- main() threads base_ref/head_sha from the event payload through to run() ---
+
+
+def test_main_extracts_base_ref_and_head_sha_from_event(monkeypatch, tmp_path):
+    event = {
+        "pull_request": {
+            "number": 9,
+            "base": {"ref": "main"},
+            "head": {"sha": "deadbeef"},
+        }
+    }
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+
+    captured = {}
+
+    def fake_run(pr_number, repo, token, **kwargs):
+        captured["pr_number"] = pr_number
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_module, "run", fake_run)
+
+    main_module.main([])
+
+    assert captured["pr_number"] == 9
+    assert captured["base_ref"] == "main"
+    assert captured["head_sha"] == "deadbeef"

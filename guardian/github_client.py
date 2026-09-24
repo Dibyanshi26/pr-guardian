@@ -1,8 +1,9 @@
 """Minimal GitHub REST API client used by PR Guardian.
 
-Deliberately small: just enough to list a PR's changed files, read issue
-comments, and create/update a comment. No retries, no caching — Phase 1
-keeps this simple and adds robustness later if it proves necessary.
+Deliberately small: list a PR's changed files, read/create/update issue
+comments, list open PRs, and create/update a check run. No retries, no
+caching — Phase 1 keeps this simple and adds robustness later if it
+proves necessary; Phase 2 hasn't needed to change that.
 """
 
 from __future__ import annotations
@@ -61,5 +62,62 @@ class GitHubClient:
     def update_comment(self, comment_id: int, body: str) -> dict:
         url = f"{self.base_url}/repos/{self.repo}/issues/comments/{comment_id}"
         response = self.session.patch(url, json={"body": body})
+        response.raise_for_status()
+        return response.json()
+
+    def list_open_prs(self) -> list[dict]:
+        """Return each open PR as {"number", "title", "head_sha", "head_ref"}."""
+        prs = self._paginated_get(f"/repos/{self.repo}/pulls?state=open")
+        return [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "head_sha": pr["head"]["sha"],
+                "head_ref": pr["head"]["ref"],
+            }
+            for pr in prs
+        ]
+
+    def find_check_run(self, head_sha: str, name: str) -> dict | None:
+        """Look up an existing check run by name for head_sha, so a rerun
+        of the same commit updates it instead of creating a duplicate.
+
+        Uses its own pagination loop rather than _paginated_get: this
+        endpoint wraps results in {"check_runs": [...]} instead of
+        returning a bare list.
+        """
+        url = f"{self.base_url}/repos/{self.repo}/commits/{head_sha}/check-runs"
+        params = {"check_name": name, "per_page": 100}
+        while url:
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            for run in response.json().get("check_runs", []):
+                if run.get("name") == name:
+                    return run
+            url = response.links.get("next", {}).get("url")
+            params = None
+        return None
+
+    def create_check_run(self, head_sha: str, name: str, title: str, summary: str, conclusion: str) -> dict:
+        url = f"{self.base_url}/repos/{self.repo}/check-runs"
+        payload = {
+            "name": name,
+            "head_sha": head_sha,
+            "status": "completed",
+            "conclusion": conclusion,
+            "output": {"title": title, "summary": summary},
+        }
+        response = self.session.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def update_check_run(self, check_run_id: int, title: str, summary: str, conclusion: str) -> dict:
+        url = f"{self.base_url}/repos/{self.repo}/check-runs/{check_run_id}"
+        payload = {
+            "status": "completed",
+            "conclusion": conclusion,
+            "output": {"title": title, "summary": summary},
+        }
+        response = self.session.patch(url, json=payload)
         response.raise_for_status()
         return response.json()
