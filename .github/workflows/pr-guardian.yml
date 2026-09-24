@@ -39,4 +39,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
+          # Optional: only needed for Phase 3's Claude analysis. If unset,
+          # Guardian logs a notice and still publishes Phase 1/2 results.
+          # See README.md for how to add this as a repo secret.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python -m guardian.main

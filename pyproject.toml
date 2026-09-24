@@ -5,6 +5,8 @@ description = "GitHub bot that catches silent failures in pull requests"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "anthropic>=1.8",
+    "pydantic>=2.0",
 ]
 
 [build-system]

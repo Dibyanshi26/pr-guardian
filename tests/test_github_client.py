@@ -26,12 +26,25 @@ def _client() -> GitHubClient:
 
 def test_list_pr_files_single_page(monkeypatch):
     client = _client()
-    files = [{"filename": "src/app.py"}]
+    files = [{"filename": "src/app.py", "patch": "@@ -1 +1 @@\n-old\n+new"}]
     monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(files)))
 
     result = client.list_pr_files(42)
 
-    assert result == [{"filename": "src/app.py", "previous_filename": None}]
+    assert result == [
+        {"filename": "src/app.py", "previous_filename": None, "patch": "@@ -1 +1 @@\n-old\n+new"}
+    ]
+
+
+def test_list_pr_files_patch_is_none_when_github_omits_it(monkeypatch):
+    # GitHub omits "patch" for binary files and files too large to diff.
+    client = _client()
+    files = [{"filename": "assets/logo.png"}]
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(files)))
+
+    result = client.list_pr_files(42)
+
+    assert result == [{"filename": "assets/logo.png", "previous_filename": None, "patch": None}]
 
 
 # --- Pagination: multiple pages via the Link header ---
@@ -111,8 +124,8 @@ def test_list_pr_files_includes_previous_filename_for_renames(monkeypatch):
     result = client.list_pr_files(1)
 
     assert result == [
-        {"filename": "archive/0001_init.sql", "previous_filename": "migrations/0001_init.sql"},
-        {"filename": "src/app.py", "previous_filename": None},
+        {"filename": "archive/0001_init.sql", "previous_filename": "migrations/0001_init.sql", "patch": None},
+        {"filename": "src/app.py", "previous_filename": None, "patch": None},
     ]
 
 

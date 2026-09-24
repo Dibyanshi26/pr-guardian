@@ -7,6 +7,7 @@ spamming a new one on every push.
 
 from __future__ import annotations
 
+from guardian.claude_analysis import ClaudeAnalysisOutcome
 from guardian.contracts import ContractAnalysis
 from guardian.merge_check import MergeCheckReport, MergeCheckResult
 from guardian.overlap import PROverlap
@@ -112,10 +113,46 @@ def _overlap_section(overlaps: list[PROverlap] | None) -> list[str]:
     return lines
 
 
+_RISK_EMOJI = {"none": "✅", "low": "🟡", "medium": "🟠", "high": "🔴"}
+
+
+def _claude_section(outcome: ClaudeAnalysisOutcome | None) -> list[str]:
+    if outcome is None:
+        return []
+
+    lines = ["### Claude's analysis", ""]
+
+    if outcome.result is None:
+        reason = outcome.unavailable_reason or "unknown error"
+        lines.append(f"_Claude's analysis is unavailable ({reason}). Phase 1/2 findings above still stand._")
+        return lines
+
+    result = outcome.result
+    emoji = _RISK_EMOJI.get(result.risk, "")
+    lines.append(f"{emoji} **Risk: {result.risk}** ({result.category})")
+    lines.append("")
+    lines.append(result.explanation)
+
+    if result.evidence:
+        lines.append("")
+        for ev in result.evidence:
+            location = f"`{ev.file}`" + (f":{ev.line}" if ev.line is not None else "")
+            lines.append(f"- {location} — {ev.note}")
+
+    lines.append("")
+    lines.append(
+        "_This is Claude's automated judgment, provided as additional context "
+        "for the human reviewer. It does not change PR Guardian's warn-only "
+        "behavior or its Phase 1/2 findings above._"
+    )
+    return lines
+
+
 def build_comment(
     analysis: ContractAnalysis,
     merge_report: MergeCheckReport | None = None,
     overlaps: list[PROverlap] | None = None,
+    claude_outcome: ClaudeAnalysisOutcome | None = None,
 ) -> str:
     lines = [COMMENT_MARKER, "## PR Guardian", ""]
     lines.extend(_contract_section(analysis))
@@ -130,6 +167,11 @@ def build_comment(
         lines.append("")
         lines.extend(overlap_lines)
 
+    claude_lines = _claude_section(claude_outcome)
+    if claude_lines:
+        lines.append("")
+        lines.extend(claude_lines)
+
     return "\n".join(lines)
 
 
@@ -137,6 +179,7 @@ def build_check_run_summary(
     analysis: ContractAnalysis,
     merge_report: MergeCheckReport | None = None,
     overlaps: list[PROverlap] | None = None,
+    claude_outcome: ClaudeAnalysisOutcome | None = None,
 ) -> tuple[str, str]:
     """Return (title, summary_markdown) for the Check Run output field."""
     flags = []
@@ -148,6 +191,8 @@ def build_check_run_summary(
             flags.append("merge conflicts detected")
     if overlaps:
         flags.append(f"{len(overlaps)} overlapping PR{'s' if len(overlaps) != 1 else ''}")
+    if claude_outcome is not None and claude_outcome.result is not None:
+        flags.append(f"Claude risk: {claude_outcome.result.risk}")
 
     title = "; ".join(flags) if flags else "No issues detected"
 
@@ -163,6 +208,11 @@ def build_check_run_summary(
     if overlap_lines:
         lines.append("")
         lines.extend(overlap_lines)
+
+    claude_lines = _claude_section(claude_outcome)
+    if claude_lines:
+        lines.append("")
+        lines.extend(claude_lines)
 
     return title, "\n".join(lines)
 

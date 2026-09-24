@@ -39,14 +39,22 @@ class GitHubClient:
         return results
 
     def list_pr_files(self, pr_number: int) -> list[dict]:
-        """Return each changed file as {"filename", "previous_filename"}.
+        """Return each changed file as {"filename", "previous_filename", "patch"}.
 
         previous_filename is included (as None when absent) so callers can
-        classify renamed files by their old path too, not just their new one.
+        classify renamed files by their old path too, not just their new
+        one. patch is the file's unified-diff hunk (None when GitHub omits
+        it -- binary files, or files too large) -- Phase 3's Claude
+        analysis uses it to scope prompt content to just the flagged files
+        instead of the whole PR diff.
         """
         files = self._paginated_get(f"/repos/{self.repo}/pulls/{pr_number}/files")
         return [
-            {"filename": f["filename"], "previous_filename": f.get("previous_filename")}
+            {
+                "filename": f["filename"],
+                "previous_filename": f.get("previous_filename"),
+                "patch": f.get("patch"),
+            }
             for f in files
         ]
 
