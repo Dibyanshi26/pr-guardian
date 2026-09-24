@@ -1,0 +1,1 @@
+- Added users.phone column for SMS notifications
