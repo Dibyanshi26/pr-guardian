@@ -1,4 +1,4 @@
-"""Phase 3: ask Claude to judge the real risk behind a Phase 1/2 finding.
+"""Phase 3: ask an AI model to judge the real risk behind a Phase 1/2 finding.
 
 This is a judgment layer on top of Phase 1's contract-vs-release-notes
 check and Phase 2's merge-conflict/overlap checks -- never a replacement
@@ -8,13 +8,13 @@ hunks for the specific files that triggered a Phase 1/2 flag are sent
 (`trigger_filenames` / `build_diff_context`), truncated to a hard size
 budget.
 
-Untrusted input: the diff content sent to Claude comes from an external
-contributor and is treated as data to analyze, never as instructions
-(see SYSTEM_PROMPT). Symmetrically, Claude's JSON output is treated as
-data by the rest of Guardian too -- main.py never branches on any field
-of ClaudeAnalysisResult, and the check run conclusion stays the literal
-"neutral" regardless of what Claude returns. Claude's verdict is
-advisory input to the report only.
+Untrusted input: the diff content sent to the model comes from an
+external contributor and is treated as data to analyze, never as
+instructions (see SYSTEM_PROMPT). Symmetrically, the model's JSON output
+is treated as data by the rest of Guardian too -- main.py never branches
+on any field of AIAnalysisResult, and the check run conclusion stays the
+literal "neutral" regardless of what the model returns. The model's
+verdict is advisory input to the report only.
 """
 
 from __future__ import annotations
@@ -23,14 +23,14 @@ import sys
 from dataclasses import dataclass
 from typing import Literal
 
-from anthropic import Anthropic
+from openai import OpenAI
 from pydantic import BaseModel
 
 from guardian.contracts import ContractAnalysis
 from guardian.merge_check import MergeCheckReport
 from guardian.overlap import PROverlap
 
-MODEL = "claude-sonnet-5"
+MODEL = "gpt-6-luna"
 MAX_OUTPUT_TOKENS = 4096
 MAX_DIFF_CHARS_PER_FILE = 4000
 MAX_TOTAL_DIFF_CHARS = 20000
@@ -64,7 +64,7 @@ class Evidence(BaseModel):
     note: str
 
 
-class ClaudeAnalysisResult(BaseModel):
+class AIAnalysisResult(BaseModel):
     risk: Literal["none", "low", "medium", "high"]
     category: Literal["database", "api", "config", "merge_conflict", "overlap", "other"]
     explanation: str
@@ -72,9 +72,9 @@ class ClaudeAnalysisResult(BaseModel):
 
 
 @dataclass
-class ClaudeAnalysisOutcome:
+class AIAnalysisOutcome:
     attempted: bool
-    result: ClaudeAnalysisResult | None = None
+    result: AIAnalysisResult | None = None
     unavailable_reason: str | None = None
 
 
@@ -85,7 +85,7 @@ def should_analyze(
 ) -> bool:
     """True iff Phase 1 or Phase 2 found something worth a second look.
     Checked before touching the network or even checking for an API key,
-    so unflagged PRs never call Claude at all."""
+    so unflagged PRs never call the model at all."""
     if result.flagged:
         return True
     if merge_report is not None:
@@ -103,7 +103,7 @@ def trigger_filenames(
     overlaps: list[PROverlap] | None,
 ) -> set[str]:
     """The specific files that caused a Phase 1/2 flag -- the only files
-    whose diff hunks are eligible to be sent to Claude."""
+    whose diff hunks are eligible to be sent to the model."""
     files: set[str] = set()
     for paths in result.contract_files.values():
         files.update(paths)
@@ -182,30 +182,33 @@ def build_diff_context(
     return "\n\n".join(blocks) if blocks else "(No diff hunks available for the flagged files.)"
 
 
-def call_claude(client, findings_summary: str, diff_context: str) -> ClaudeAnalysisResult | None:
-    """Ask Claude to assess risk given the findings and diff context.
+def call_model(client, findings_summary: str, diff_context: str) -> AIAnalysisResult | None:
+    """Ask the model to assess risk given the findings and diff context.
     Retries once on a failed attempt (a raised exception, or an
-    unexpectedly-None parsed_output) before giving up. Never raises --
-    returns None after two failed attempts."""
+    unexpectedly-None output_parsed) before giving up. Never raises --
+    returns None after two failed attempts. Every failed attempt is
+    logged to stderr so a real failure is diagnosable from the GitHub
+    Actions log without needing local reproduction."""
     user_content = (
         f"Findings that triggered this analysis:\n{findings_summary}\n\n"
         f"Diff hunks for the flagged files:\n\n{diff_context}\n\n"
         "Assess the actual risk of this change."
     )
 
-    for _ in range(2):
+    for attempt in range(1, 3):
         try:
-            response = client.messages.parse(
+            response = client.responses.parse(
                 model=MODEL,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_content}],
-                output_format=ClaudeAnalysisResult,
+                instructions=SYSTEM_PROMPT,
+                input=user_content,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                text_format=AIAnalysisResult,
             )
-            if response.parsed_output is not None:
-                return response.parsed_output
-        except Exception:
-            continue
+            if response.output_parsed is not None:
+                return response.output_parsed
+            print(f"PR Guardian: model returned no parsed output on attempt {attempt}/2.", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - any failure here just means "retry, then degrade"
+            print(f"PR Guardian: model call failed on attempt {attempt}/2 ({exc}).", file=sys.stderr)
 
     return None
 
@@ -216,38 +219,38 @@ def analyze_pr(
     merge_report: MergeCheckReport | None,
     overlaps: list[PROverlap] | None,
     files: list[str | dict],
-) -> ClaudeAnalysisOutcome | None:
+) -> AIAnalysisOutcome | None:
     """Top-level Phase 3 entry point: gate on should_analyze, then on the
-    API key, then call Claude. Returns None when Phase 3 never triggered
-    at all (nothing for report.py to render); otherwise always returns a
-    ClaudeAnalysisOutcome. Never raises -- any failure anywhere in this
-    function degrades to an "unavailable" outcome instead."""
+    API key, then call the model. Returns None when Phase 3 never
+    triggered at all (nothing for report.py to render); otherwise always
+    returns an AIAnalysisOutcome. Never raises -- any failure anywhere in
+    this function degrades to an "unavailable" outcome instead."""
     if not should_analyze(result, merge_report, overlaps):
         return None
 
     if not api_key:
-        print("PR Guardian: ANTHROPIC_API_KEY not set; skipping Claude analysis.", file=sys.stderr)
-        return ClaudeAnalysisOutcome(
+        print("PR Guardian: OPENAI_API_KEY not set; skipping AI risk analysis.", file=sys.stderr)
+        return AIAnalysisOutcome(
             attempted=True,
             result=None,
-            unavailable_reason="ANTHROPIC_API_KEY is not configured",
+            unavailable_reason="OPENAI_API_KEY is not configured",
         )
 
     try:
-        client = Anthropic(api_key=api_key)
+        client = OpenAI(api_key=api_key)
         findings_summary = build_findings_summary(result, merge_report, overlaps)
         triggers = trigger_filenames(result, merge_report, overlaps)
         diff_context = build_diff_context(files, triggers)
-        claude_result = call_claude(client, findings_summary, diff_context)
+        model_result = call_model(client, findings_summary, diff_context)
     except Exception as exc:  # noqa: BLE001 - Phase 3 must never take down the run
-        print(f"PR Guardian: Claude analysis failed unexpectedly ({exc}); continuing without it.", file=sys.stderr)
-        return ClaudeAnalysisOutcome(attempted=True, result=None, unavailable_reason="an unexpected error occurred")
+        print(f"PR Guardian: AI risk analysis failed unexpectedly ({exc}); continuing without it.", file=sys.stderr)
+        return AIAnalysisOutcome(attempted=True, result=None, unavailable_reason="an unexpected error occurred")
 
-    if claude_result is None:
-        return ClaudeAnalysisOutcome(
+    if model_result is None:
+        return AIAnalysisOutcome(
             attempted=True,
             result=None,
-            unavailable_reason="Claude did not return a valid analysis after a retry",
+            unavailable_reason="the model did not return a valid analysis after a retry",
         )
 
-    return ClaudeAnalysisOutcome(attempted=True, result=claude_result)
+    return AIAnalysisOutcome(attempted=True, result=model_result)

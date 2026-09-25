@@ -1,20 +1,18 @@
-"""Tests for claude_analysis.py. No real network calls and no real
-anthropic.Anthropic() is ever constructed -- a fake client stands in for
-the SDK, the same way FakeClient stands in for GitHubClient in
+"""Tests for ai_analysis.py. No real network calls and no real
+openai.OpenAI() is ever constructed -- a fake client stands in for the
+SDK, the same way FakeClient stands in for GitHubClient in
 test_main.py."""
 
 from __future__ import annotations
 
-import pytest
-
-from guardian.claude_analysis import (
+from guardian.ai_analysis import (
     SYSTEM_PROMPT,
-    ClaudeAnalysisOutcome,
-    ClaudeAnalysisResult,
+    AIAnalysisOutcome,
+    AIAnalysisResult,
     analyze_pr,
     build_diff_context,
     build_findings_summary,
-    call_claude,
+    call_model,
     should_analyze,
     trigger_filenames,
 )
@@ -23,12 +21,12 @@ from guardian.merge_check import MergeCheckReport, MergeCheckResult
 from guardian.overlap import PROverlap
 
 
-class FakeParseResult:
-    def __init__(self, parsed_output):
-        self.parsed_output = parsed_output
+class FakeParsedResponse:
+    def __init__(self, output_parsed):
+        self.output_parsed = output_parsed
 
 
-class FakeMessages:
+class FakeResponses:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
@@ -38,18 +36,18 @@ class FakeMessages:
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return FakeParseResult(parsed_output=item)
+        return FakeParsedResponse(output_parsed=item)
 
 
-class FakeAnthropicClient:
+class FakeOpenAIClient:
     def __init__(self, responses):
-        self.messages = FakeMessages(responses)
+        self.responses = FakeResponses(responses)
 
 
-def _result(**overrides) -> ClaudeAnalysisResult:
+def _result(**overrides) -> AIAnalysisResult:
     defaults = dict(risk="medium", category="database", explanation="looks risky", evidence=[])
     defaults.update(overrides)
-    return ClaudeAnalysisResult(**defaults)
+    return AIAnalysisResult(**defaults)
 
 
 # --- should_analyze: the "only run when there's something to investigate" gate ---
@@ -194,68 +192,97 @@ def test_diff_context_ignores_plain_string_entries():
     assert "No diff hunks available" in context
 
 
-# --- call_claude: retry-then-degrade ---
+# --- call_model: retry-then-degrade, with every failed attempt logged ---
 
 
-def test_call_claude_returns_valid_result_on_first_try():
+def test_call_model_returns_valid_result_on_first_try():
     expected = _result()
-    client = FakeAnthropicClient(responses=[expected])
+    client = FakeOpenAIClient(responses=[expected])
 
-    result = call_claude(client, "findings", "diff context")
+    result = call_model(client, "findings", "diff context")
 
     assert result is expected
-    assert len(client.messages.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
-def test_call_claude_retries_once_after_a_failure_then_succeeds():
+def test_call_model_retries_once_after_a_failure_then_succeeds():
     expected = _result()
-    client = FakeAnthropicClient(responses=[ValueError("bad json"), expected])
+    client = FakeOpenAIClient(responses=[ValueError("bad json"), expected])
 
-    result = call_claude(client, "findings", "diff context")
+    result = call_model(client, "findings", "diff context")
 
     assert result is expected
-    assert len(client.messages.calls) == 2
+    assert len(client.responses.calls) == 2
 
 
-def test_call_claude_degrades_to_none_after_two_failures():
-    client = FakeAnthropicClient(responses=[ValueError("bad json"), ValueError("bad json again")])
+def test_call_model_degrades_to_none_after_two_failures():
+    client = FakeOpenAIClient(responses=[ValueError("bad json"), ValueError("bad json again")])
 
-    result = call_claude(client, "findings", "diff context")
-
-    assert result is None
-    assert len(client.messages.calls) == 2
-
-
-def test_call_claude_treats_none_parsed_output_as_a_failure():
-    client = FakeAnthropicClient(responses=[None, None])
-
-    result = call_claude(client, "findings", "diff context")
+    result = call_model(client, "findings", "diff context")
 
     assert result is None
-    assert len(client.messages.calls) == 2
+    assert len(client.responses.calls) == 2
 
 
-def test_call_claude_uses_output_format_and_the_documented_model():
-    client = FakeAnthropicClient(responses=[_result()])
+def test_call_model_treats_none_output_parsed_as_a_failure():
+    client = FakeOpenAIClient(responses=[None, None])
 
-    call_claude(client, "findings", "diff context")
+    result = call_model(client, "findings", "diff context")
 
-    call = client.messages.calls[0]
-    assert call["output_format"] is ClaudeAnalysisResult
-    assert call["model"] == "claude-sonnet-5"
-    assert call["system"] == SYSTEM_PROMPT
+    assert result is None
+    assert len(client.responses.calls) == 2
+
+
+def test_call_model_uses_text_format_and_the_documented_model():
+    client = FakeOpenAIClient(responses=[_result()])
+
+    call_model(client, "findings", "diff context")
+
+    call = client.responses.calls[0]
+    assert call["text_format"] is AIAnalysisResult
+    assert call["model"] == "gpt-6-luna"
+    assert call["instructions"] == SYSTEM_PROMPT
+
+
+def test_call_model_logs_a_raised_exception_on_each_failed_attempt(capsys):
+    client = FakeOpenAIClient(responses=[ValueError("network blip"), ValueError("network blip again")])
+
+    call_model(client, "findings", "diff context")
+
+    err = capsys.readouterr().err
+    assert err.count("attempt 1/2") == 1
+    assert err.count("attempt 2/2") == 1
+    assert "network blip" in err
+
+
+def test_call_model_logs_when_output_parsed_is_unexpectedly_none(capsys):
+    client = FakeOpenAIClient(responses=[None, None])
+
+    call_model(client, "findings", "diff context")
+
+    err = capsys.readouterr().err
+    assert "no parsed output" in err
+    assert err.count("attempt") == 2
+
+
+def test_call_model_logs_nothing_on_a_first_try_success(capsys):
+    client = FakeOpenAIClient(responses=[_result()])
+
+    call_model(client, "findings", "diff context")
+
+    assert capsys.readouterr().err == ""
 
 
 # --- analyze_pr: the top-level seam main.py depends on ---
 
 
 def test_analyze_pr_returns_none_when_not_triggered(monkeypatch):
-    import guardian.claude_analysis as claude_analysis_module
+    import guardian.ai_analysis as ai_analysis_module
 
     def _explode(*args, **kwargs):
-        raise AssertionError("Anthropic should never be constructed when not triggered")
+        raise AssertionError("OpenAI should never be constructed when not triggered")
 
-    monkeypatch.setattr(claude_analysis_module, "Anthropic", _explode)
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", _explode)
 
     result = analyze("src/app.py".split())  # unflagged
     outcome = analyze_pr("fake-key", result, merge_report=None, overlaps=None, files=["src/app.py"])
@@ -264,27 +291,27 @@ def test_analyze_pr_returns_none_when_not_triggered(monkeypatch):
 
 
 def test_analyze_pr_skips_gracefully_without_api_key(monkeypatch):
-    import guardian.claude_analysis as claude_analysis_module
+    import guardian.ai_analysis as ai_analysis_module
 
     def _explode(*args, **kwargs):
-        raise AssertionError("Anthropic should never be constructed without an API key")
+        raise AssertionError("OpenAI should never be constructed without an API key")
 
-    monkeypatch.setattr(claude_analysis_module, "Anthropic", _explode)
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", _explode)
 
     result = analyze(["migrations/0001.sql"])
     outcome = analyze_pr(None, result, merge_report=None, overlaps=None, files=[{"filename": "migrations/0001.sql", "patch": "x"}])
 
-    assert outcome == ClaudeAnalysisOutcome(
-        attempted=True, result=None, unavailable_reason="ANTHROPIC_API_KEY is not configured"
+    assert outcome == AIAnalysisOutcome(
+        attempted=True, result=None, unavailable_reason="OPENAI_API_KEY is not configured"
     )
 
 
 def test_analyze_pr_happy_path_returns_wrapped_result(monkeypatch):
-    import guardian.claude_analysis as claude_analysis_module
+    import guardian.ai_analysis as ai_analysis_module
 
     expected = _result(risk="high")
-    fake_client = FakeAnthropicClient(responses=[expected])
-    monkeypatch.setattr(claude_analysis_module, "Anthropic", lambda api_key: fake_client)
+    fake_client = FakeOpenAIClient(responses=[expected])
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: fake_client)
 
     result = analyze(["migrations/0001.sql"])
     files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ diff @@"}]
@@ -295,11 +322,11 @@ def test_analyze_pr_happy_path_returns_wrapped_result(monkeypatch):
     assert outcome.unavailable_reason is None
 
 
-def test_analyze_pr_degrades_when_call_claude_exhausts_retries(monkeypatch):
-    import guardian.claude_analysis as claude_analysis_module
+def test_analyze_pr_degrades_when_call_model_exhausts_retries(monkeypatch):
+    import guardian.ai_analysis as ai_analysis_module
 
-    fake_client = FakeAnthropicClient(responses=[ValueError("bad"), ValueError("bad again")])
-    monkeypatch.setattr(claude_analysis_module, "Anthropic", lambda api_key: fake_client)
+    fake_client = FakeOpenAIClient(responses=[ValueError("bad"), ValueError("bad again")])
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: fake_client)
 
     result = analyze(["migrations/0001.sql"])
     files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ diff @@"}]
@@ -311,13 +338,13 @@ def test_analyze_pr_degrades_when_call_claude_exhausts_retries(monkeypatch):
 
 
 def test_analyze_pr_never_raises_on_an_unexpected_internal_error(monkeypatch):
-    import guardian.claude_analysis as claude_analysis_module
+    import guardian.ai_analysis as ai_analysis_module
 
     def _broken_build_diff_context(*args, **kwargs):
         raise RuntimeError("unexpected bug")
 
-    monkeypatch.setattr(claude_analysis_module, "Anthropic", lambda api_key: FakeAnthropicClient(responses=[_result()]))
-    monkeypatch.setattr(claude_analysis_module, "build_diff_context", _broken_build_diff_context)
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: FakeOpenAIClient(responses=[_result()]))
+    monkeypatch.setattr(ai_analysis_module, "build_diff_context", _broken_build_diff_context)
 
     result = analyze(["migrations/0001.sql"])
     outcome = analyze_pr("fake-key", result, merge_report=None, overlaps=None, files=[])  # must not raise

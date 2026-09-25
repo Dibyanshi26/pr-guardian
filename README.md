@@ -13,19 +13,19 @@ or Phase 2 (merge-conflict and cross-PR overlap checks).
 
 ### Configuration
 
-**`ANTHROPIC_API_KEY`** — optional, only used by Phase 3 (Claude's risk
+**`OPENAI_API_KEY`** — optional, only used by Phase 3 (an AI model's risk
 analysis on top of whatever Phase 1/2 already flagged). Without it, Guardian
 logs a notice in the run and still publishes the Phase 1/2 results as
 normal; nothing fails.
 
 To add it:
 
-1. Get an API key from the [Claude Console](https://platform.claude.com/settings/keys).
+1. Get an API key from the [OpenAI platform](https://platform.openai.com/api-keys).
 2. In the repo, go to **Settings → Secrets and variables → Actions → New
    repository secret**.
-3. Name it `ANTHROPIC_API_KEY` and paste the key.
+3. Name it `OPENAI_API_KEY` and paste the key.
 
-Claude analysis only runs on PRs that Phase 1 or Phase 2 already flagged,
+The AI analysis only runs on PRs that Phase 1 or Phase 2 already flagged,
 and only sends the diff hunks for the specific files that triggered a flag
 — never the whole PR diff — to keep cost and prompt size bounded (see
 CLAUDE.md's Phase 3 notes for the exact scoping and budget).

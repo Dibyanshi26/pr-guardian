@@ -410,7 +410,7 @@ def test_main_extracts_base_ref_and_head_sha_from_event(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
     monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
     monkeypatch.setenv("GITHUB_TOKEN", "x")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-fake")
 
     captured = {}
 
@@ -425,50 +425,50 @@ def test_main_extracts_base_ref_and_head_sha_from_event(monkeypatch, tmp_path):
     assert captured["pr_number"] == 9
     assert captured["base_ref"] == "main"
     assert captured["head_sha"] == "deadbeef"
-    assert captured["anthropic_api_key"] == "sk-ant-fake"
+    assert captured["openai_api_key"] == "sk-openai-fake"
 
 
-# --- Phase 3: Claude analysis, gated on should_analyze inside analyze_pr,
+# --- Phase 3: AI risk analysis, gated on should_analyze inside analyze_pr,
 # reached through main.py via the single `analyze_pr` seam (mirrors how
 # Phase 2 is reached through `run_merge_checks`) ---
 
 
-def test_claude_section_appears_when_analyze_pr_returns_a_result(monkeypatch):
-    from guardian.claude_analysis import ClaudeAnalysisOutcome, ClaudeAnalysisResult
+def test_ai_section_appears_when_analyze_pr_returns_a_result(monkeypatch):
+    from guardian.ai_analysis import AIAnalysisOutcome, AIAnalysisResult
 
     fake_client = FakeClient(files=["migrations/0001.sql"])
     _patch_client(monkeypatch, fake_client)
-    outcome = ClaudeAnalysisOutcome(
+    outcome = AIAnalysisOutcome(
         attempted=True,
-        result=ClaudeAnalysisResult(risk="high", category="database", explanation="risky migration", evidence=[]),
+        result=AIAnalysisResult(risk="high", category="database", explanation="risky migration", evidence=[]),
     )
     monkeypatch.setattr(main_module, "analyze_pr", lambda *args, **kwargs: outcome)
 
     main_module.run(pr_number=1, repo="acme/widgets", token="x")
 
     body = fake_client.created[0]
-    assert "### Claude's analysis" in body
+    assert "### AI risk analysis" in body
     assert "Risk: high" in body
     assert "risky migration" in body
 
 
-def test_claude_section_shows_unavailable_reason_when_degraded(monkeypatch):
-    from guardian.claude_analysis import ClaudeAnalysisOutcome
+def test_ai_section_shows_unavailable_reason_when_degraded(monkeypatch):
+    from guardian.ai_analysis import AIAnalysisOutcome
 
     fake_client = FakeClient(files=["migrations/0001.sql"])
     _patch_client(monkeypatch, fake_client)
-    outcome = ClaudeAnalysisOutcome(attempted=True, result=None, unavailable_reason="ANTHROPIC_API_KEY is not configured")
+    outcome = AIAnalysisOutcome(attempted=True, result=None, unavailable_reason="OPENAI_API_KEY is not configured")
     monkeypatch.setattr(main_module, "analyze_pr", lambda *args, **kwargs: outcome)
 
     main_module.run(pr_number=1, repo="acme/widgets", token="x")
 
     body = fake_client.created[0]
-    assert "### Claude's analysis" in body
+    assert "### AI risk analysis" in body
     assert "unavailable" in body
-    assert "ANTHROPIC_API_KEY is not configured" in body
+    assert "OPENAI_API_KEY is not configured" in body
 
 
-def test_claude_section_absent_when_analyze_pr_returns_none(monkeypatch):
+def test_ai_section_absent_when_analyze_pr_returns_none(monkeypatch):
     fake_client = FakeClient(files=["src/unrelated.py"])  # nothing flagged
     _patch_client(monkeypatch, fake_client)
     monkeypatch.setattr(main_module, "analyze_pr", lambda *args, **kwargs: None)
@@ -476,10 +476,10 @@ def test_claude_section_absent_when_analyze_pr_returns_none(monkeypatch):
     main_module.run(pr_number=1, repo="acme/widgets", token="x")
 
     body = fake_client.created[0]
-    assert "### Claude's analysis" not in body
+    assert "### AI risk analysis" not in body
 
 
-def test_analyze_pr_receives_anthropic_api_key_and_findings(monkeypatch):
+def test_analyze_pr_receives_openai_api_key_and_findings(monkeypatch):
     fake_client = FakeClient(files=["migrations/0001.sql"])
     _patch_client(monkeypatch, fake_client)
     captured = {}
@@ -491,26 +491,26 @@ def test_analyze_pr_receives_anthropic_api_key_and_findings(monkeypatch):
 
     monkeypatch.setattr(main_module, "analyze_pr", fake_analyze_pr)
 
-    main_module.run(pr_number=1, repo="acme/widgets", token="x", anthropic_api_key="sk-ant-fake")
+    main_module.run(pr_number=1, repo="acme/widgets", token="x", openai_api_key="sk-openai-fake")
 
-    assert captured["api_key"] == "sk-ant-fake"
+    assert captured["api_key"] == "sk-openai-fake"
     assert captured["files"] == ["migrations/0001.sql"]
 
 
-# --- Prompt-injection-style Claude output must never change Guardian's own
+# --- Prompt-injection-style AI output must never change Guardian's own
 # control flow: the check run conclusion stays the literal "neutral" and
 # Phase 1/2's own findings render untouched, regardless of what a
 # (hypothetically compromised) model wrote into its JSON fields. ---
 
 
-def test_injection_shaped_claude_output_does_not_alter_control_flow(monkeypatch):
-    from guardian.claude_analysis import ClaudeAnalysisOutcome, ClaudeAnalysisResult
+def test_injection_shaped_ai_output_does_not_alter_control_flow(monkeypatch):
+    from guardian.ai_analysis import AIAnalysisOutcome, AIAnalysisResult
 
     fake_client = FakeClient(files=["migrations/0001.sql"])
     _patch_client(monkeypatch, fake_client)
-    compromised_outcome = ClaudeAnalysisOutcome(
+    compromised_outcome = AIAnalysisOutcome(
         attempted=True,
-        result=ClaudeAnalysisResult(
+        result=AIAnalysisResult(
             risk="none",
             category="other",
             explanation=(

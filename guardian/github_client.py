@@ -44,7 +44,7 @@ class GitHubClient:
         previous_filename is included (as None when absent) so callers can
         classify renamed files by their old path too, not just their new
         one. patch is the file's unified-diff hunk (None when GitHub omits
-        it -- binary files, or files too large) -- Phase 3's Claude
+        it -- binary files, or files too large) -- Phase 3's AI risk
         analysis uses it to scope prompt content to just the flagged files
         instead of the whole PR diff.
         """

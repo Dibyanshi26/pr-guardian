@@ -1,22 +1,23 @@
 """Entry point: read a GitHub Actions pull_request event, analyze the PR's
 changed files, check it for merge conflicts and file overlap against
-other open PRs, optionally ask Claude to judge the risk behind whatever
-got flagged, and upsert PR Guardian's summary comment and check run.
+other open PRs, optionally ask an AI model to judge the risk behind
+whatever got flagged, and upsert PR Guardian's summary comment and check
+run.
 
 Ground rules (see CLAUDE.md for the full list):
 - Warn-only: this never fails the run, even when a PR is flagged. The
   check run conclusion is always "neutral", never "failure".
 - Untrusted input: file paths, diff content, and existing comment bodies
   are the only GitHub-sourced data used, and only ever as data — never as
-  instructions. Symmetrically, Claude's JSON output is treated as data by
-  this module too: no field of it is ever branched on.
+  instructions. Symmetrically, the model's JSON output is treated as data
+  by this module too: no field of it is ever branched on.
 - One comment per PR: always upsert via the HTML marker in report.py.
 - Phase 2 (merge conflicts / overlap) is best-effort on top of Phase 1:
   if listing open PRs or the git operations in merge_check.py fail
   outright, the contract-file comment from Phase 1 still gets posted.
-- Phase 3 (Claude analysis) only runs when Phase 1/2 found something to
+- Phase 3 (AI risk analysis) only runs when Phase 1/2 found something to
   investigate, and is itself best-effort on top of Phase 1/2 -- see
-  claude_analysis.analyze_pr, whose contract is that it never raises.
+  ai_analysis.analyze_pr, whose contract is that it never raises.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import sys
 
 import requests
 
-from guardian.claude_analysis import analyze_pr
+from guardian.ai_analysis import analyze_pr
 from guardian.contracts import analyze
 from guardian.github_client import GitHubClient
 from guardian.merge_check import run_merge_checks
@@ -70,7 +71,7 @@ def run(
     repo_path: str = ".",
     base_ref: str | None = None,
     head_sha: str | None = None,
-    anthropic_api_key: str | None = None,
+    openai_api_key: str | None = None,
 ) -> None:
     client = GitHubClient(token=token, repo=repo)
     files = client.list_pr_files(pr_number)
@@ -78,9 +79,9 @@ def run(
 
     merge_report, overlaps = _run_phase2_checks(client, pr_number, files, repo_path, base_ref)
 
-    claude_outcome = analyze_pr(anthropic_api_key, result, merge_report, overlaps, files)
+    ai_outcome = analyze_pr(openai_api_key, result, merge_report, overlaps, files)
 
-    body = build_comment(result, merge_report=merge_report, overlaps=overlaps, claude_outcome=claude_outcome)
+    body = build_comment(result, merge_report=merge_report, overlaps=overlaps, ai_outcome=ai_outcome)
 
     try:
         comments = client.list_issue_comments(pr_number)
@@ -93,7 +94,7 @@ def run(
         _handle_comment_post_failure(exc, body)
 
     if head_sha:
-        _publish_check_run(client, head_sha, result, merge_report, overlaps, claude_outcome)
+        _publish_check_run(client, head_sha, result, merge_report, overlaps, ai_outcome)
 
 
 def _run_phase2_checks(client, pr_number, files, repo_path, base_ref):
@@ -128,9 +129,9 @@ def _run_phase2_checks(client, pr_number, files, repo_path, base_ref):
         return None, None
 
 
-def _publish_check_run(client, head_sha: str, result, merge_report, overlaps, claude_outcome) -> None:
+def _publish_check_run(client, head_sha: str, result, merge_report, overlaps, ai_outcome) -> None:
     title, summary = build_check_run_summary(
-        result, merge_report=merge_report, overlaps=overlaps, claude_outcome=claude_outcome
+        result, merge_report=merge_report, overlaps=overlaps, ai_outcome=ai_outcome
     )
     try:
         existing = client.find_check_run(head_sha, CHECK_RUN_NAME)
@@ -231,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             token,
             base_ref=_base_ref_from_event(event),
             head_sha=_head_sha_from_event(event),
-            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            openai_api_key=os.environ.get("OPENAI_API_KEY"),
         )
     except Exception as exc:  # noqa: BLE001 - warn-only, never fail the run
         print(f"PR Guardian encountered an error (warn-only, not failing): {exc}", file=sys.stderr)

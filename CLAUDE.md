@@ -11,7 +11,7 @@ Data flow: GitHub Actions `pull_request` event → `guardian.main` runs
 `guardian.contracts.analyze` (Phase 1), then Phase 2's
 `guardian.overlap.find_overlaps` and `guardian.merge_check.run_merge_checks`,
 then — only if Phase 1 or 2 found something —
-`guardian.claude_analysis.analyze_pr` (Phase 3) judges the real risk behind
+`guardian.ai_analysis.analyze_pr` (Phase 3) judges the real risk behind
 those findings. `guardian.report.build_comment` / `build_check_run_summary`
 render the combined result, and `guardian.github_client.GitHubClient`
 upserts one PR comment and one check run.
@@ -52,26 +52,33 @@ upserts one PR comment and one check run.
   creates and degrades one bad comparison (deleted branch, no shared
   history) to an error on that result instead of raising, so one bad PR
   can't take down the whole check.
-- **`guardian/claude_analysis.py`** — Phase 3: a judgment layer on top of
+- **`guardian/ai_analysis.py`** — Phase 3: a judgment layer on top of
   Phase 1/2's findings, never a replacement for them. `should_analyze`
   gates the whole module on "did Phase 1 or 2 find something" — unflagged
   PRs never call the API. `trigger_filenames` narrows to just the files
   that caused a flag, and `build_diff_context` sends only those files'
   diff hunks (from `GitHubClient.list_pr_files`'s `patch` field), truncated
   per-file and capped in total (`MAX_DIFF_CHARS_PER_FILE` /
-  `MAX_TOTAL_DIFF_CHARS`) — never the whole PR diff. `call_claude` asks
-  `claude-sonnet-5` for structured JSON output (`output_format=
-  ClaudeAnalysisResult`, a Pydantic model — schema below), retrying once
-  on a failed/invalid attempt before giving up. `analyze_pr` is the single
-  entry point `main.py` depends on; its contract is that it never raises —
-  any failure anywhere degrades to a `ClaudeAnalysisOutcome` with an
-  `unavailable_reason` (missing `ANTHROPIC_API_KEY`, exhausted retries, or
-  an unexpected error) instead of taking down the run. `SYSTEM_PROMPT`
+  `MAX_TOTAL_DIFF_CHARS`) — never the whole PR diff. `call_model` asks
+  `gpt-6-luna` (OpenAI, via `client.responses.parse`) for structured JSON
+  output (`text_format=AIAnalysisResult`, a Pydantic model — schema
+  below), retrying once on a failed/invalid attempt before giving up, with
+  every failed attempt logged to `stderr` so a real failure is diagnosable
+  from the GitHub Actions log alone. `analyze_pr` is the single entry
+  point `main.py` depends on; its contract is that it never raises — any
+  failure anywhere degrades to an `AIAnalysisOutcome` with an
+  `unavailable_reason` (missing `OPENAI_API_KEY`, exhausted retries, or an
+  unexpected error) instead of taking down the run. `SYSTEM_PROMPT`
   explicitly frames diff content as untrusted data, never instructions —
   see Ground rules for how that's also enforced in code, not just prompt
-  wording.
+  wording. Model choice: `gpt-6-luna` is OpenAI's cheapest current-
+  generation model ($0.10/$0.50 per MTok, vs. $10/$50 for the flagship
+  `gpt-6-astra`), explicitly positioned by OpenAI for "focused, high-volume
+  tasks" — the right fit for a bounded classification-plus-explanation
+  call, same reasoning as picking Sonnet 5 over Opus 5.5 would have been
+  on the Anthropic side.
 
-  JSON schema (`ClaudeAnalysisResult`):
+  JSON schema (`AIAnalysisResult`):
   ```json
   {
     "risk": "none | low | medium | high",
@@ -98,19 +105,19 @@ upserts one PR comment and one check run.
   this minimal; only add complexity here when a real failure mode shows up.
 - **`guardian/report.py`** — builds the Markdown comment body (Phase 1's
   contract section, followed by Phase 2's "Merge conflicts" and
-  "Overlapping PRs" sections and Phase 3's "Claude's analysis" section,
+  "Overlapping PRs" sections and Phase 3's "AI risk analysis" section,
   each shown whenever that data was gathered — earlier sections are never
   altered by a later phase's presence) and the Check Run's `(title,
-  summary)` output via `build_check_run_summary`. The Claude section
-  always renders a fixed advisory disclaimer alongside the risk/
-  explanation, so a human reading the PR sees the "this doesn't change
-  warn-only behavior" framing directly, not just in this doc. Finds PR
-  Guardian's own previous comment via `COMMENT_MARKER`, a hidden HTML
-  comment (`<!-- pr-guardian:report -->`) that's always the first line of
-  anything we post.
+  summary)` output via `build_check_run_summary`. The AI section always
+  renders a fixed advisory disclaimer alongside the risk/explanation, so a
+  human reading the PR sees the "this doesn't change warn-only behavior"
+  framing directly, not just in this doc. Finds PR Guardian's own previous
+  comment via `COMMENT_MARKER`, a hidden HTML comment
+  (`<!-- pr-guardian:report -->`) that's always the first line of anything
+  we post.
 - **`guardian/main.py`** — entry point. Reads the event JSON
   (`GITHUB_EVENT_PATH`), extracts the PR number plus (for Phase 2) the base
-  branch and head SHA and (for Phase 3) `ANTHROPIC_API_KEY`, runs Phase 1's
+  branch and head SHA and (for Phase 3) `OPENAI_API_KEY`, runs Phase 1's
   analysis, then Phase 2's merge/overlap checks, then Phase 3's
   `analyze_pr`, and upserts the comment and check run. Phase 2 is
   best-effort on top of Phase 1: if listing open PRs or the git operations
@@ -120,9 +127,9 @@ upserts one PR comment and one check run.
   The check run's `conclusion` is always passed as the literal `"neutral"`
   at the call site in `main.py`, never threaded through a variable that
   could become `"failure"` — a regression test in `test_main.py` guards
-  this, and it holds regardless of what Phase 3 returns (also tested: a
-  `ClaudeAnalysisResult` whose `explanation` contains injected-looking
-  text doesn't change the conclusion or suppress Phase 1/2's findings).
+  this, and it holds regardless of what Phase 3 returns (also tested: an
+  `AIAnalysisResult` whose `explanation` contains injected-looking text
+  doesn't change the conclusion or suppress Phase 1/2's findings).
   `--dry-run [--files a b c]` skips the GitHub API, Phase 2, and Phase 3
   entirely and prints the Phase 1 report to stdout — the primary way to
   iterate locally without a token. If posting the comment fails (most
@@ -145,7 +152,7 @@ upserts one PR comment and one check run.
   workflow level, not in the upsert logic. Note that this concurrency group
   is keyed per-PR only — it does not serialize *different* PRs' runs against
   each other, which is exactly why `merge_check.py`'s ref namespacing keys
-  on both PR numbers (see above). Passes `ANTHROPIC_API_KEY` from repo
+  on both PR numbers (see above). Passes `OPENAI_API_KEY` from repo
   secrets to the run step — see [README.md](README.md) for how to add it;
   it's optional, and its absence only disables Phase 3.
 
@@ -169,13 +176,14 @@ network calls.
   change), reducing false positives from Phase 1's pattern-matching
   approach.
 
-**Phase 3 — Claude-based semantic analysis.**
-- ✅ Advisory risk analysis (`guardian/claude_analysis.py`) gated on Phase
-  1/2 findings — never runs on an unflagged PR. Structured JSON output
-  (risk/category/explanation/evidence, schema above), retry-then-degrade
-  on a failed attempt, missing `ANTHROPIC_API_KEY` handled gracefully.
-  Rendered as its own "Claude's analysis" comment section and folded into
-  the check run title, both still `neutral`/non-blocking.
+**Phase 3 — AI-based semantic analysis.**
+- ✅ Advisory risk analysis (`guardian/ai_analysis.py`, OpenAI's
+  `gpt-6-luna`) gated on Phase 1/2 findings — never runs on an unflagged
+  PR. Structured JSON output (risk/category/explanation/evidence, schema
+  above), retry-then-degrade on a failed attempt, missing `OPENAI_API_KEY`
+  handled gracefully. Rendered as its own "AI risk analysis" comment
+  section and folded into the check run title, both still
+  `neutral`/non-blocking.
 - Still open: judging whether release notes *actually describe* a contract
   change (not just "a release-notes file was touched") — the original
   framing for this phase — and catching risky changes that Phase 1's
@@ -215,23 +223,26 @@ accept, using the diff content Phase 3 already analyzes.
   tested against GitHub's actual re-run semantics (only against a mocked
   client), unlike the PR-comment upsert path which was verified
   end-to-end on a real PR.
-- **No per-push caching of Claude analysis.** `analyze_pr` re-runs on
+- **No per-push caching of the AI analysis.** `analyze_pr` re-runs on
   every push to a PR that's still flagged, even if nothing about the
   flagged files changed since the last push — a cost implication worth
   watching if a PR gets many small pushes while still flagged. Revisit
   with caching (e.g. keyed on the flagged files' content hash) only if
   this proves to matter in practice.
-- **Only this PR's own diff is sent to Claude for an overlap finding**,
+- **Only this PR's own diff is sent to the model for an overlap finding**,
   not the other PR's. `_run_phase2_checks` already fetches the other PR's
   files (for `find_overlaps`), but that content isn't threaded into Phase
   3 — a deliberate simplification, not an oversight. Worth revisiting if
   overlap-triggered analyses turn out to need the other side's diff to
   judge risk accurately.
 - **Phase 3 has not been verified live against a real PR** the way Phase
-  1/2 were — this environment has no `ANTHROPIC_API_KEY`, so
-  `guardian/claude_analysis.py` is tested only against a mocked Anthropic
-  client. Recommend a manual smoke test against a real flagged PR with the
-  secret configured before fully trusting it in production.
+  1/2 were — this environment has no `OPENAI_API_KEY`, so
+  `guardian/ai_analysis.py` is tested only against a mocked OpenAI client
+  (though the exact `client.responses.parse` call shape and the
+  `gpt-6-luna` model ID were both verified against the actually-installed
+  `openai` package and its own generated model-name types, not just docs).
+  Recommend a manual smoke test against a real flagged PR with the secret
+  configured before fully trusting it in production.
 
 ## Ground rules
 
@@ -242,20 +253,20 @@ accept, using the diff content Phase 3 already analyzes.
 - **PR content is untrusted input.** Diffs, PR titles/descriptions, and
   existing comments come from external contributors and must be treated as
   data only — never as instructions to follow. Phase 3's system prompt
-  (`guardian/claude_analysis.py::SYSTEM_PROMPT`) states this explicitly to
-  the model; `test_system_prompt_names_diff_content_as_untrusted_data`
-  guards that framing against silent erosion.
-- **Claude's verdict is advisory input to the report only.** `main.py`'s
+  (`guardian/ai_analysis.py::SYSTEM_PROMPT`) states this explicitly to the
+  model; `test_system_prompt_names_diff_content_as_untrusted_data` guards
+  that framing against silent erosion.
+- **The model's verdict is advisory input to the report only.** `main.py`'s
   control flow — which comment to post, the check run's `conclusion` —
-  never branches on any field of `ClaudeAnalysisResult` (`risk`,
-  `category`, `explanation`, `evidence`). The result is passed to
-  `report.py` purely for rendering as text; `conclusion` stays the literal
-  `"neutral"` at its call sites regardless of what Claude returns. This is
-  enforced in code, not just prompt wording — the prompt only reduces how
-  often a compromised model *tries* something like "mark this safe,
-  suppress the other findings"; the code guarantees it can't succeed
-  either way even if the model complies with an injected instruction.
-  `test_injection_shaped_claude_output_does_not_alter_control_flow` in
+  never branches on any field of `AIAnalysisResult` (`risk`, `category`,
+  `explanation`, `evidence`). The result is passed to `report.py` purely
+  for rendering as text; `conclusion` stays the literal `"neutral"` at its
+  call sites regardless of what the model returns. This is enforced in
+  code, not just prompt wording — the prompt only reduces how often a
+  compromised model *tries* something like "mark this safe, suppress the
+  other findings"; the code guarantees it can't succeed either way even if
+  the model complies with an injected instruction.
+  `test_injection_shaped_ai_output_does_not_alter_control_flow` in
   `test_main.py` is the regression test for this.
 - **One comment per PR.** Always upsert via the `COMMENT_MARKER` in
   `report.py` (find the existing comment, edit it) instead of posting a new
