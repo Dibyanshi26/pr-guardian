@@ -13,6 +13,7 @@ from guardian.ai_analysis import (
     build_diff_context,
     build_findings_summary,
     call_model,
+    findings_fingerprint,
     should_analyze,
     trigger_filenames,
 )
@@ -301,9 +302,10 @@ def test_analyze_pr_skips_gracefully_without_api_key(monkeypatch):
     result = analyze(["migrations/0001.sql"])
     outcome = analyze_pr(None, result, merge_report=None, overlaps=None, files=[{"filename": "migrations/0001.sql", "patch": "x"}])
 
-    assert outcome == AIAnalysisOutcome(
-        attempted=True, result=None, unavailable_reason="OPENAI_API_KEY is not configured"
-    )
+    assert outcome.attempted is True
+    assert outcome.result is None
+    assert outcome.unavailable_reason == "OPENAI_API_KEY is not configured"
+    assert outcome.fingerprint is not None  # computed even when skipping, for the next re-check to compare against
 
 
 def test_analyze_pr_happy_path_returns_wrapped_result(monkeypatch):
@@ -362,3 +364,138 @@ def test_system_prompt_names_diff_content_as_untrusted_data():
     assert "untrusted" in lowered
     assert "not instructions" in lowered
     assert "advisory" in lowered
+
+
+# --- findings_fingerprint: Phase 4's re-run gate ---
+
+
+def _phase12(files=("migrations/0001.sql",), merge_report=None, overlaps=None):
+    result = analyze(list(files))
+    return result, merge_report, overlaps
+
+
+def test_fingerprint_is_deterministic_for_identical_inputs():
+    result, merge_report, overlaps = _phase12()
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    assert findings_fingerprint(result, merge_report, overlaps, files) == findings_fingerprint(
+        result, merge_report, overlaps, files
+    )
+
+
+def test_fingerprint_changes_when_a_conflicting_file_changes():
+    result, _, _ = _phase12()
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    merge_report_a = MergeCheckReport(against_base=MergeCheckResult(label="main", conflicted=True, conflicting_files=["f.py"]))
+    merge_report_b = MergeCheckReport(against_base=MergeCheckResult(label="main", conflicted=True, conflicting_files=["g.py"]))
+
+    fp_a = findings_fingerprint(result, merge_report_a, None, files)
+    fp_b = findings_fingerprint(result, merge_report_b, None, files)
+
+    assert fp_a != fp_b
+
+
+def test_fingerprint_changes_when_the_overlapping_pr_changes():
+    result, _, _ = _phase12(files=("src/app.py",))
+    files = [{"filename": "src/app.py", "previous_filename": None, "patch": "@@ a @@"}]
+    overlaps_a = [PROverlap(pr_number=12, title="pr 12", shared_files=["src/app.py"])]
+    overlaps_b = [PROverlap(pr_number=15, title="pr 15", shared_files=["src/app.py"])]
+
+    fp_a = findings_fingerprint(result, None, overlaps_a, files)
+    fp_b = findings_fingerprint(result, None, overlaps_b, files)
+
+    assert fp_a != fp_b
+
+
+def test_fingerprint_changes_when_diff_content_changes():
+    result, merge_report, overlaps = _phase12()
+    files_a = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ old @@"}]
+    files_b = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ new @@"}]
+
+    fp_a = findings_fingerprint(result, merge_report, overlaps, files_a)
+    fp_b = findings_fingerprint(result, merge_report, overlaps, files_b)
+
+    assert fp_a != fp_b
+
+
+def test_fingerprint_is_stable_against_an_unflagged_file_being_present():
+    result, merge_report, overlaps = _phase12()
+    files_a = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    files_b = files_a + [{"filename": "README.md", "previous_filename": None, "patch": "@@ unrelated @@"}]
+
+    fp_a = findings_fingerprint(result, merge_report, overlaps, files_a)
+    fp_b = findings_fingerprint(result, merge_report, overlaps, files_b)
+
+    assert fp_a == fp_b
+
+
+# --- analyze_pr's `cached` parameter: skip the model on an unchanged fingerprint ---
+
+
+def test_analyze_pr_reuses_cached_result_on_matching_fingerprint(monkeypatch):
+    import guardian.ai_analysis as ai_analysis_module
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("OpenAI should never be constructed on a fingerprint-matching cache hit")
+
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", _explode)
+
+    result = analyze(["migrations/0001.sql"])
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    fingerprint = findings_fingerprint(result, None, None, files)
+    cached_result = _result(risk="low")
+
+    outcome = analyze_pr("fake-key", result, merge_report=None, overlaps=None, files=files, cached=(fingerprint, cached_result))
+
+    assert outcome.attempted is True
+    assert outcome.result is cached_result
+    assert outcome.fingerprint == fingerprint
+
+
+def test_analyze_pr_calls_model_when_cached_fingerprint_does_not_match(monkeypatch):
+    import guardian.ai_analysis as ai_analysis_module
+
+    fresh_result = _result(risk="high")
+    fake_client = FakeOpenAIClient(responses=[fresh_result])
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: fake_client)
+
+    result = analyze(["migrations/0001.sql"])
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    stale_cached_result = _result(risk="low")
+
+    outcome = analyze_pr(
+        "fake-key", result, merge_report=None, overlaps=None, files=files, cached=("stale-fingerprint-that-wont-match", stale_cached_result)
+    )
+
+    assert outcome.result is fresh_result
+    assert len(fake_client.responses.calls) == 1
+
+
+def test_analyze_pr_ignores_cached_none_default_and_behaves_as_before(monkeypatch):
+    # cached defaults to None -- every Phase 3 call site predates Phase 4
+    # and passes nothing here; confirm the default keeps calling the
+    # model normally (no accidental "always skip" regression).
+    import guardian.ai_analysis as ai_analysis_module
+
+    fresh_result = _result()
+    fake_client = FakeOpenAIClient(responses=[fresh_result])
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: fake_client)
+
+    result = analyze(["migrations/0001.sql"])
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+
+    outcome = analyze_pr("fake-key", result, merge_report=None, overlaps=None, files=files)
+
+    assert outcome.result is fresh_result
+
+
+def test_analyze_pr_populates_fingerprint_on_a_fresh_successful_call(monkeypatch):
+    import guardian.ai_analysis as ai_analysis_module
+
+    result = analyze(["migrations/0001.sql"])
+    files = [{"filename": "migrations/0001.sql", "previous_filename": None, "patch": "@@ a @@"}]
+    fake_client = FakeOpenAIClient(responses=[_result()])
+    monkeypatch.setattr(ai_analysis_module, "OpenAI", lambda api_key: fake_client)
+
+    outcome = analyze_pr("fake-key", result, merge_report=None, overlaps=None, files=files)
+
+    assert outcome.fingerprint == findings_fingerprint(result, None, None, files)

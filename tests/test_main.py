@@ -30,6 +30,9 @@ class FakeClient:
         list_open_prs_error=None,
         existing_check_run=None,
         create_check_run_error=None,
+        pr_states=None,
+        pr_head_shas=None,
+        get_pr_error=None,
     ):
         self._files = files or []
         self._comments = comments or []
@@ -41,10 +44,14 @@ class FakeClient:
         self._list_open_prs_error = list_open_prs_error
         self._existing_check_run = existing_check_run
         self._create_check_run_error = create_check_run_error
+        self._pr_states = pr_states or {}
+        self._pr_head_shas = pr_head_shas or {}
+        self._get_pr_error = get_pr_error
         self.created = []
         self.updated = []
         self.created_check_runs = []
         self.updated_check_runs = []
+        self.get_pr_calls = []
 
     def list_pr_files(self, pr_number):
         if self._list_files_error:
@@ -68,6 +75,14 @@ class FakeClient:
         if self._list_open_prs_error:
             raise self._list_open_prs_error
         return self._open_prs
+
+    def get_pr(self, pr_number):
+        if self._get_pr_error:
+            raise self._get_pr_error
+        self.get_pr_calls.append(pr_number)
+        state = self._pr_states.get(pr_number, "open")
+        head_sha = self._pr_head_shas.get(pr_number, f"sha{pr_number}")
+        return {"number": pr_number, "state": state, "head_sha": head_sha}
 
     def find_check_run(self, head_sha, name):
         return self._existing_check_run
@@ -484,9 +499,10 @@ def test_analyze_pr_receives_openai_api_key_and_findings(monkeypatch):
     _patch_client(monkeypatch, fake_client)
     captured = {}
 
-    def fake_analyze_pr(api_key, result, merge_report, overlaps, files):
+    def fake_analyze_pr(api_key, result, merge_report, overlaps, files, cached=None):
         captured["api_key"] = api_key
         captured["files"] = files
+        captured["cached"] = cached
         return None
 
     monkeypatch.setattr(main_module, "analyze_pr", fake_analyze_pr)
@@ -534,3 +550,174 @@ def test_injection_shaped_ai_output_does_not_alter_control_flow(monkeypatch):
     # never reads risk/category/explanation to decide this.
     assert len(fake_client.created_check_runs) == 1
     assert fake_client.created_check_runs[0]["conclusion"] == "neutral"
+
+
+# --- Phase 4: re-checking open PRs on a push to the base branch ---
+
+
+def test_base_ref_from_push_event_extracts_branch_name():
+    event = {"ref": "refs/heads/main"}
+    assert main_module._base_ref_from_push_event(event) == "main"
+
+
+def test_base_ref_from_push_event_none_for_a_tag_push():
+    event = {"ref": "refs/tags/v1.0.0"}
+    assert main_module._base_ref_from_push_event(event) is None
+
+
+def test_base_ref_from_push_event_none_when_ref_missing():
+    assert main_module._base_ref_from_push_event({}) is None
+
+
+def test_main_dispatches_to_run_for_all_open_prs_on_a_push_event(monkeypatch, tmp_path):
+    event = {"ref": "refs/heads/main"}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-fake")
+
+    captured = {}
+
+    def fake_run_for_all_open_prs(repo, token, **kwargs):
+        captured["repo"] = repo
+        captured["token"] = token
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_module, "run_for_all_open_prs", fake_run_for_all_open_prs)
+
+    exit_code = main_module.main([])
+
+    assert exit_code == 0
+    assert captured["repo"] == "acme/widgets"
+    assert captured["base_ref"] == "main"
+    assert captured["openai_api_key"] == "sk-openai-fake"
+
+
+def test_main_skips_push_event_with_unrecognizable_ref(monkeypatch, tmp_path):
+    event = {"ref": "refs/tags/v1.0.0"}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("run_for_all_open_prs should not be called for an unrecognizable ref")
+
+    monkeypatch.setattr(main_module, "run_for_all_open_prs", _explode)
+
+    exit_code = main_module.main([])
+
+    assert exit_code == 0
+
+
+def test_main_still_uses_the_pull_request_path_when_event_name_is_unset(monkeypatch, tmp_path):
+    # Every pre-Phase-4 test relies on this: GITHUB_EVENT_NAME defaults
+    # to "pull_request" so nothing needs updating for the dispatch to work.
+    event = {"pull_request": {"number": 9}}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+
+    captured = {}
+    monkeypatch.setattr(main_module, "run", lambda pr_number, repo, token, **kwargs: captured.update(pr_number=pr_number))
+
+    main_module.main([])
+
+    assert captured["pr_number"] == 9
+
+
+# --- run_for_all_open_prs: the batch orchestration itself ---
+
+
+def test_run_for_all_open_prs_calls_run_once_per_open_pr(monkeypatch):
+    fake_client = FakeClient(
+        open_prs=[
+            {"number": 1, "title": "pr 1", "head_sha": "stale-sha-1", "head_ref": "b1"},
+            {"number": 2, "title": "pr 2", "head_sha": "stale-sha-2", "head_ref": "b2"},
+        ],
+        pr_head_shas={1: "fresh-sha-1", 2: "fresh-sha-2"},
+    )
+    _patch_client(monkeypatch, fake_client)
+    calls = []
+    monkeypatch.setattr(main_module, "run", lambda pr_number, repo, token, **kwargs: calls.append((pr_number, kwargs)))
+
+    main_module.run_for_all_open_prs("acme/widgets", "x", base_ref="main", openai_api_key="sk-fake")
+
+    assert [c[0] for c in calls] == [1, 2]
+    # Uses each PR's freshly fetched head SHA, not the possibly-stale one
+    # from the initial list_open_prs() snapshot.
+    assert calls[0][1]["head_sha"] == "fresh-sha-1"
+    assert calls[1][1]["head_sha"] == "fresh-sha-2"
+    assert calls[0][1]["base_ref"] == "main"
+    assert calls[0][1]["openai_api_key"] == "sk-fake"
+
+
+def test_run_for_all_open_prs_skips_a_pr_that_closed_before_processing(monkeypatch):
+    fake_client = FakeClient(
+        open_prs=[
+            {"number": 1, "title": "pr 1", "head_sha": "sha1", "head_ref": "b1"},
+            {"number": 2, "title": "pr 2", "head_sha": "sha2", "head_ref": "b2"},
+        ],
+        pr_states={1: "closed"},  # merged/closed between listing and processing
+    )
+    _patch_client(monkeypatch, fake_client)
+    calls = []
+    monkeypatch.setattr(main_module, "run", lambda pr_number, repo, token, **kwargs: calls.append(pr_number))
+
+    main_module.run_for_all_open_prs("acme/widgets", "x", base_ref="main")
+
+    assert calls == [2]  # PR #1 skipped, PR #2 still processed
+
+
+def test_run_for_all_open_prs_continues_after_one_pr_fails(monkeypatch):
+    fake_client = FakeClient(
+        open_prs=[
+            {"number": 1, "title": "pr 1", "head_sha": "sha1", "head_ref": "b1"},
+            {"number": 2, "title": "pr 2", "head_sha": "sha2", "head_ref": "b2"},
+        ],
+    )
+    _patch_client(monkeypatch, fake_client)
+    calls = []
+
+    def fake_run(pr_number, repo, token, **kwargs):
+        if pr_number == 1:
+            raise RuntimeError("boom")
+        calls.append(pr_number)
+
+    monkeypatch.setattr(main_module, "run", fake_run)
+
+    main_module.run_for_all_open_prs("acme/widgets", "x", base_ref="main")  # must not raise
+
+    assert calls == [2]
+
+
+def test_run_for_all_open_prs_degrades_when_listing_open_prs_fails(monkeypatch):
+    fake_client = FakeClient(list_open_prs_error=RuntimeError("API down"))
+    _patch_client(monkeypatch, fake_client)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("run should never be called if list_open_prs itself failed")
+
+    monkeypatch.setattr(main_module, "run", _explode)
+
+    main_module.run_for_all_open_prs("acme/widgets", "x", base_ref="main")  # must not raise
+
+
+def test_run_for_all_open_prs_with_no_open_prs_calls_run_zero_times(monkeypatch):
+    fake_client = FakeClient(open_prs=[])
+    _patch_client(monkeypatch, fake_client)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("run should not be called when there are no open PRs")
+
+    monkeypatch.setattr(main_module, "run", _explode)
+
+    main_module.run_for_all_open_prs("acme/widgets", "x", base_ref="main")  # must not raise

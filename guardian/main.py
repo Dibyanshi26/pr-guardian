@@ -18,6 +18,9 @@ Ground rules (see CLAUDE.md for the full list):
 - Phase 3 (AI risk analysis) only runs when Phase 1/2 found something to
   investigate, and is itself best-effort on top of Phase 1/2 -- see
   ai_analysis.analyze_pr, whose contract is that it never raises.
+- Phase 4 (re-checking open PRs on a push to the base branch) reuses
+  run()'s entire per-PR pipeline unchanged via run_for_all_open_prs --
+  see there for how one bad PR is isolated from the rest of the batch.
 """
 
 from __future__ import annotations
@@ -34,7 +37,13 @@ from guardian.contracts import analyze
 from guardian.github_client import GitHubClient
 from guardian.merge_check import run_merge_checks
 from guardian.overlap import find_overlaps
-from guardian.report import CHECK_RUN_NAME, build_check_run_summary, build_comment, find_existing_comment
+from guardian.report import (
+    CHECK_RUN_NAME,
+    build_check_run_summary,
+    build_comment,
+    find_cached_ai_result,
+    find_existing_comment,
+)
 
 
 def _load_event(event_path: str) -> dict:
@@ -63,6 +72,17 @@ def _head_sha_from_event(event: dict) -> str | None:
     return (pr.get("head") or {}).get("sha")
 
 
+def _base_ref_from_push_event(event: dict) -> str | None:
+    """Pull the branch name out of a push event's "ref" field, e.g.
+    "refs/heads/main" -> "main". None for a push to something that isn't
+    a branch (a tag push, say), or a malformed/missing ref."""
+    ref = event.get("ref")
+    prefix = "refs/heads/"
+    if not ref or not ref.startswith(prefix):
+        return None
+    return ref[len(prefix):]
+
+
 def run(
     pr_number: int,
     repo: str,
@@ -79,13 +99,27 @@ def run(
 
     merge_report, overlaps = _run_phase2_checks(client, pr_number, files, repo_path, base_ref)
 
-    ai_outcome = analyze_pr(openai_api_key, result, merge_report, overlaps, files)
+    # Fetched before analyze_pr so a matching AI-result cache (Phase 4:
+    # re-checks skip the model when nothing relevant changed) can be
+    # passed in. A failure here isn't raised -- existing stays None,
+    # which means "nothing to update yet", so the code below naturally
+    # falls through to create_comment, which surfaces the same
+    # underlying failure through the already-handled path below.
+    existing = None
+    cached_ai_result = None
+    try:
+        comments = client.list_issue_comments(pr_number)
+        existing = find_existing_comment(comments)
+        if existing:
+            cached_ai_result = find_cached_ai_result(existing)
+    except requests.exceptions.HTTPError:
+        pass
+
+    ai_outcome = analyze_pr(openai_api_key, result, merge_report, overlaps, files, cached=cached_ai_result)
 
     body = build_comment(result, merge_report=merge_report, overlaps=overlaps, ai_outcome=ai_outcome)
 
     try:
-        comments = client.list_issue_comments(pr_number)
-        existing = find_existing_comment(comments)
         if existing:
             client.update_comment(existing["id"], body)
         else:
@@ -143,6 +177,57 @@ def _publish_check_run(client, head_sha: str, result, merge_report, overlaps, ai
         # Never fail the run over the check run alone -- the PR comment above
         # already carries the same information.
         print(f"PR Guardian: could not publish check run ({exc}).", file=sys.stderr)
+
+
+def run_for_all_open_prs(
+    repo: str,
+    token: str,
+    *,
+    repo_path: str = ".",
+    base_ref: str,
+    openai_api_key: str | None = None,
+) -> None:
+    """Phase 4: re-check every currently-open PR after a push to the base
+    branch, so a Phase 2/3 finding about a *pair* of PRs doesn't go stale
+    just because the other half of that pair changed independently (it
+    merged, got force-pushed, or a new PR opened touching the same
+    files). Reuses run()'s entire per-PR pipeline and upsert logic
+    unchanged -- this is just a new way to reach it for every open PR,
+    not a second comment/check-run code path.
+
+    Each PR is isolated: fetched fresh (state + head SHA) immediately
+    before processing, since the initial open-PR list can go stale
+    partway through a long batch run; a PR that's no longer open by then
+    is skipped, not treated as an error. Any other per-PR failure is
+    logged and the batch continues -- one bad PR must never abort the
+    rest. listing open PRs at all failing degrades the same way, logged
+    rather than raised.
+    """
+    client = GitHubClient(token=token, repo=repo)
+    try:
+        open_prs = client.list_open_prs()
+    except Exception as exc:  # noqa: BLE001 - never fail the whole re-check run
+        print(f"PR Guardian: could not list open PRs for the main-push re-check ({exc}); skipping.", file=sys.stderr)
+        return
+
+    for pr in open_prs:
+        pr_number = pr["number"]
+        try:
+            fresh = client.get_pr(pr_number)
+            if fresh["state"] != "open":
+                print(f"PR Guardian: PR #{pr_number} is no longer open; skipping its re-check.", file=sys.stderr)
+                continue
+            run(
+                pr_number,
+                repo,
+                token,
+                repo_path=repo_path,
+                base_ref=base_ref,
+                head_sha=fresh["head_sha"],
+                openai_api_key=openai_api_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad PR must not abort the batch
+            print(f"PR Guardian: re-check failed for PR #{pr_number} ({exc}); continuing.", file=sys.stderr)
 
 
 def _handle_comment_post_failure(exc: requests.exceptions.HTTPError, body: str) -> None:
@@ -214,15 +299,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     event = _load_event(event_path)
-    pr_number = _pr_number_from_event(event)
-    if pr_number is None:
-        print("No pull_request number found in event payload; skipping.", file=sys.stderr)
-        return 0
 
     repo = os.environ.get("GITHUB_REPOSITORY")
     token = os.environ.get("GITHUB_TOKEN")
     if not repo or not token:
         print("GITHUB_REPOSITORY/GITHUB_TOKEN not set; skipping.", file=sys.stderr)
+        return 0
+
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "pull_request")
+
+    if event_name == "push":
+        base_ref = _base_ref_from_push_event(event)
+        if base_ref is None:
+            print("PR Guardian: push event has no recognizable branch ref; skipping.", file=sys.stderr)
+            return 0
+        try:
+            run_for_all_open_prs(repo, token, base_ref=base_ref, openai_api_key=openai_api_key)
+        except Exception as exc:  # noqa: BLE001 - warn-only, never fail the run
+            print(f"PR Guardian encountered an error during the main-push re-check (warn-only, not failing): {exc}", file=sys.stderr)
+        return 0
+
+    pr_number = _pr_number_from_event(event)
+    if pr_number is None:
+        print("No pull_request number found in event payload; skipping.", file=sys.stderr)
         return 0
 
     try:
@@ -232,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             token,
             base_ref=_base_ref_from_event(event),
             head_sha=_head_sha_from_event(event),
-            openai_api_key=os.environ.get("OPENAI_API_KEY"),
+            openai_api_key=openai_api_key,
         )
     except Exception as exc:  # noqa: BLE001 - warn-only, never fail the run
         print(f"PR Guardian encountered an error (warn-only, not failing): {exc}", file=sys.stderr)

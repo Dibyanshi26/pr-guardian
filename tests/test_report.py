@@ -6,6 +6,7 @@ from guardian.report import (
     COMMENT_MARKER,
     build_check_run_summary,
     build_comment,
+    find_cached_ai_result,
     find_existing_comment,
 )
 
@@ -300,3 +301,71 @@ def test_check_run_summary_title_omits_ai_risk_when_unavailable():
     title, _ = build_check_run_summary(result, ai_outcome=outcome)
     assert "AI risk" not in title
     assert title == "No issues detected"
+
+
+# --- Phase 4: the AI-result cache round-trips through the comment body ---
+
+
+def test_cache_marker_is_embedded_as_a_hidden_html_comment():
+    result = analyze(["migrations/0001_init.sql"])
+    outcome = AIAnalysisOutcome(
+        attempted=True,
+        result=AIAnalysisResult(risk="high", category="database", explanation="risky", evidence=[]),
+        fingerprint="abc123",
+    )
+    body = build_comment(result, ai_outcome=outcome)
+
+    lines = body.splitlines()
+    cache_lines = [line for line in lines if "ai-cache" in line]
+    assert len(cache_lines) == 1
+    assert cache_lines[0].startswith("<!--")
+    assert cache_lines[0].endswith("-->")
+
+
+def test_find_cached_ai_result_round_trips_through_build_comment():
+    result = analyze(["migrations/0001_init.sql"])
+    original = AIAnalysisResult(
+        risk="high",
+        category="database",
+        explanation="This migration drops a column still read by the API.",
+        evidence=[Evidence(file="migrations/0001_init.sql", line=12, note="DROP COLUMN with no backfill")],
+    )
+    outcome = AIAnalysisOutcome(attempted=True, result=original, fingerprint="fp-abc123")
+    body = build_comment(result, ai_outcome=outcome)
+
+    cached = find_cached_ai_result({"body": body})
+
+    assert cached is not None
+    fingerprint, restored = cached
+    assert fingerprint == "fp-abc123"
+    assert restored == original
+
+
+def test_find_cached_ai_result_returns_none_when_no_marker_present():
+    result = analyze(["src/app.py"])
+    body = build_comment(result)  # no ai_outcome at all
+    assert find_cached_ai_result({"body": body}) is None
+
+
+def test_find_cached_ai_result_returns_none_for_an_unavailable_outcome():
+    # An "unavailable" outcome must never look cacheable to the next run.
+    result = analyze(["migrations/0001_init.sql"])
+    outcome = AIAnalysisOutcome(attempted=True, result=None, unavailable_reason="no key", fingerprint="fp-1")
+    body = build_comment(result, ai_outcome=outcome)
+    assert find_cached_ai_result({"body": body}) is None
+
+
+def test_find_cached_ai_result_returns_none_for_an_unrelated_comment():
+    assert find_cached_ai_result({"body": "just a regular comment, nothing to do with Guardian"}) is None
+
+
+def test_find_cached_ai_result_never_raises_on_a_corrupted_marker():
+    corrupted = "<!-- pr-guardian:ai-cache:{not valid json at all -->"
+    assert find_cached_ai_result({"body": corrupted}) is None
+
+
+def test_find_cached_ai_result_never_raises_on_a_marker_with_wrong_shape():
+    # Valid JSON, but doesn't match AIAnalysisResult's schema (e.g. a
+    # hand-edited comment, or a forged cache entry).
+    malformed = '<!-- pr-guardian:ai-cache:{"fingerprint":"x","result":{"risk":"not-a-real-risk-level"}} -->'
+    assert find_cached_ai_result({"body": malformed}) is None

@@ -3,6 +3,13 @@ name: PR Guardian
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # Phase 4: re-check every open PR when something lands on main, so a
+  # Phase 2/3 finding about a *pair* of PRs (a conflict, an overlap)
+  # doesn't go stale just because the other half of that pair changed
+  # independently. Update this branch list if the repo's default branch
+  # isn't "main".
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -10,13 +17,29 @@ permissions:
   checks: write
 
 concurrency:
-  group: pr-guardian-${{ github.event.pull_request.number }}
+  # Per-PR events keep their own group (unaffected by push-triggered
+  # runs); every push-triggered run shares one group so a burst of
+  # pushes to main collapses to at most one completed re-check --
+  # cancel-in-progress below cancels each earlier one as a new push
+  # arrives, the same mechanism the per-PR grouping already relies on.
+  group: ${{ github.event_name == 'push' && 'pr-guardian-main-push' || format('pr-guardian-{0}', github.event.pull_request.number) }}
   cancel-in-progress: true
 
 jobs:
   guardian:
     runs-on: ubuntu-latest
     steps:
+      - name: Debounce rapid pushes to main
+        # First step, before checkout, so a run that's about to be
+        # superseded by the next push is cancelled before it spends
+        # anything -- not even a checkout, let alone an AI call. This is
+        # a deliberate freshness-vs-cost tradeoff: a push-triggered
+        # re-check never starts sooner than this, even a lone push with
+        # no burst behind it. Tune the delay if that tradeoff needs
+        # revisiting; it isn't load-bearing precision.
+        if: github.event_name == 'push'
+        run: sleep 90
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

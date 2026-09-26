@@ -1,9 +1,9 @@
 """Minimal GitHub REST API client used by PR Guardian.
 
 Deliberately small: list a PR's changed files, read/create/update issue
-comments, list open PRs, and create/update a check run. No retries, no
-caching — Phase 1 keeps this simple and adds robustness later if it
-proves necessary; Phase 2 hasn't needed to change that.
+comments, list/fetch open PRs, and create/update a check run. No
+retries, no caching — Phase 1 keeps this simple and adds robustness
+later if it proves necessary; nothing since has needed to change that.
 """
 
 from __future__ import annotations
@@ -85,6 +85,19 @@ class GitHubClient:
             }
             for pr in prs
         ]
+
+    def get_pr(self, pr_number: int) -> dict:
+        """Return {"number", "state", "head_sha"} for a single PR, fetched
+        fresh. Used by Phase 4's main-push re-check to confirm a PR is
+        still open -- and get its current head SHA -- immediately before
+        processing it, since the batch's initial list_open_prs() snapshot
+        can go stale partway through a long run.
+        """
+        url = f"{self.base_url}/repos/{self.repo}/pulls/{pr_number}"
+        response = self.session.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return {"number": data["number"], "state": data["state"], "head_sha": data["head"]["sha"]}
 
     def find_check_run(self, head_sha: str, name: str) -> dict | None:
         """Look up an existing check run by name for head_sha, so a rerun

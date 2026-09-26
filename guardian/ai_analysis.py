@@ -15,10 +15,18 @@ is treated as data by the rest of Guardian too -- main.py never branches
 on any field of AIAnalysisResult, and the check run conclusion stays the
 literal "neutral" regardless of what the model returns. The model's
 verdict is advisory input to the report only.
+
+Phase 4 (re-checking open PRs when the base branch moves) reuses this
+module unchanged, with one addition: `analyze_pr`'s optional `cached`
+argument lets a caller skip the API call entirely when
+`findings_fingerprint` shows nothing relevant has changed since the last
+successful call for this PR -- see report.py's AI-result cache for where
+that fingerprint and result are persisted (in Guardian's own PR comment).
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from dataclasses import dataclass
 from typing import Literal
@@ -76,6 +84,7 @@ class AIAnalysisOutcome:
     attempted: bool
     result: AIAnalysisResult | None = None
     unavailable_reason: str | None = None
+    fingerprint: str | None = None
 
 
 def should_analyze(
@@ -182,6 +191,31 @@ def build_diff_context(
     return "\n\n".join(blocks) if blocks else "(No diff hunks available for the flagged files.)"
 
 
+def _hash_findings(findings_summary: str, diff_context: str) -> str:
+    raw = f"{findings_summary}\n---\n{diff_context}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def findings_fingerprint(
+    result: ContractAnalysis,
+    merge_report: MergeCheckReport | None,
+    overlaps: list[PROverlap] | None,
+    files: list[str | dict],
+) -> str:
+    """A stable fingerprint over exactly what call_model would be sent for
+    this PR right now (the findings summary + scoped diff context) --
+    used by a re-check (Phase 4) to decide whether a fresh AI call would
+    likely produce a materially different answer from the last one, or
+    whether the previous result can be safely reused instead. Stable
+    against anything that doesn't affect the prompt (file ordering,
+    unflagged files); changes whenever the flagged files, their diffs, or
+    the Phase 1/2 findings driving the analysis actually change."""
+    triggers = trigger_filenames(result, merge_report, overlaps)
+    summary = build_findings_summary(result, merge_report, overlaps)
+    diff_context = build_diff_context(files, triggers)
+    return _hash_findings(summary, diff_context)
+
+
 def call_model(client, findings_summary: str, diff_context: str) -> AIAnalysisResult | None:
     """Ask the model to assess risk given the findings and diff context.
     Retries once on a failed attempt (a raised exception, or an
@@ -219,14 +253,43 @@ def analyze_pr(
     merge_report: MergeCheckReport | None,
     overlaps: list[PROverlap] | None,
     files: list[str | dict],
+    cached: tuple[str, AIAnalysisResult] | None = None,
 ) -> AIAnalysisOutcome | None:
-    """Top-level Phase 3 entry point: gate on should_analyze, then on the
-    API key, then call the model. Returns None when Phase 3 never
-    triggered at all (nothing for report.py to render); otherwise always
-    returns an AIAnalysisOutcome. Never raises -- any failure anywhere in
-    this function degrades to an "unavailable" outcome instead."""
+    """Top-level Phase 3 entry point: gate on should_analyze, then on a
+    matching cached result (Phase 4 re-checks), then on the API key, then
+    call the model. Returns None when Phase 3 never triggered at all
+    (nothing for report.py to render); otherwise always returns an
+    AIAnalysisOutcome. Never raises -- any failure anywhere in this
+    function degrades to an "unavailable" outcome instead.
+
+    cached is an optional (fingerprint, AIAnalysisResult) pair -- the
+    result of the last successful call for this PR, as read back from
+    Guardian's own previous comment. Only a confirmed prior success is
+    ever reused: an "unavailable" outcome is never cached by the caller
+    in the first place, so a missing key or a past failure always gets
+    retried rather than remembered forever. When the freshly computed
+    fingerprint matches, the model is never called at all -- this is
+    what keeps a re-check from re-spending on a PR whose flagged files,
+    diffs, and Phase 1/2 findings haven't actually changed since the
+    last successful analysis.
+    """
     if not should_analyze(result, merge_report, overlaps):
         return None
+
+    # Everything from here on is best-effort: a bug in any of these pure
+    # helpers, not just a failure calling the model, must still degrade
+    # to an "unavailable" outcome rather than take down the run.
+    try:
+        triggers = trigger_filenames(result, merge_report, overlaps)
+        findings_summary = build_findings_summary(result, merge_report, overlaps)
+        diff_context = build_diff_context(files, triggers)
+        fingerprint = _hash_findings(findings_summary, diff_context)
+    except Exception as exc:  # noqa: BLE001 - Phase 3 must never take down the run
+        print(f"PR Guardian: AI risk analysis failed unexpectedly ({exc}); continuing without it.", file=sys.stderr)
+        return AIAnalysisOutcome(attempted=True, result=None, unavailable_reason="an unexpected error occurred")
+
+    if cached is not None and cached[0] == fingerprint:
+        return AIAnalysisOutcome(attempted=True, result=cached[1], fingerprint=fingerprint)
 
     if not api_key:
         print("PR Guardian: OPENAI_API_KEY not set; skipping AI risk analysis.", file=sys.stderr)
@@ -234,23 +297,24 @@ def analyze_pr(
             attempted=True,
             result=None,
             unavailable_reason="OPENAI_API_KEY is not configured",
+            fingerprint=fingerprint,
         )
 
     try:
         client = OpenAI(api_key=api_key)
-        findings_summary = build_findings_summary(result, merge_report, overlaps)
-        triggers = trigger_filenames(result, merge_report, overlaps)
-        diff_context = build_diff_context(files, triggers)
         model_result = call_model(client, findings_summary, diff_context)
     except Exception as exc:  # noqa: BLE001 - Phase 3 must never take down the run
         print(f"PR Guardian: AI risk analysis failed unexpectedly ({exc}); continuing without it.", file=sys.stderr)
-        return AIAnalysisOutcome(attempted=True, result=None, unavailable_reason="an unexpected error occurred")
+        return AIAnalysisOutcome(
+            attempted=True, result=None, unavailable_reason="an unexpected error occurred", fingerprint=fingerprint
+        )
 
     if model_result is None:
         return AIAnalysisOutcome(
             attempted=True,
             result=None,
             unavailable_reason="the model did not return a valid analysis after a retry",
+            fingerprint=fingerprint,
         )
 
-    return AIAnalysisOutcome(attempted=True, result=model_result)
+    return AIAnalysisOutcome(attempted=True, result=model_result, fingerprint=fingerprint)

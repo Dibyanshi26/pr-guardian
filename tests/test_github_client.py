@@ -194,6 +194,40 @@ def test_list_open_prs_follows_link_header_across_pages(monkeypatch):
     assert mock_get.call_count == 2
 
 
+# --- get_pr ---
+
+
+def test_get_pr_maps_expected_fields_when_open(monkeypatch):
+    client = _client()
+    pr = {"number": 5, "state": "open", "head": {"sha": "abc123"}}
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(pr)))
+
+    result = client.get_pr(5)
+
+    assert result == {"number": 5, "state": "open", "head_sha": "abc123"}
+
+
+def test_get_pr_reports_closed_state(monkeypatch):
+    client = _client()
+    pr = {"number": 5, "state": "closed", "head": {"sha": "abc123"}}
+    monkeypatch.setattr(client.session, "get", Mock(return_value=_make_response(pr)))
+
+    result = client.get_pr(5)
+
+    assert result["state"] == "closed"
+
+
+def test_get_pr_hits_the_expected_url(monkeypatch):
+    client = _client()
+    pr = {"number": 5, "state": "open", "head": {"sha": "abc123"}}
+    mock_get = Mock(return_value=_make_response(pr))
+    monkeypatch.setattr(client.session, "get", mock_get)
+
+    client.get_pr(5)
+
+    assert mock_get.call_args.args[0] == "https://api.github.com/repos/acme/widgets/pulls/5"
+
+
 # --- check runs ---
 
 

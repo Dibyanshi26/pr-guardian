@@ -3,17 +3,33 @@ Guardian's own prior comment.
 
 The HTML comment marker lets us upsert a single comment per PR instead of
 spamming a new one on every push.
+
+Phase 4 adds a second hidden marker, AI_CACHE_MARKER, embedding the last
+successful AIAnalysisResult plus the findings_fingerprint it was computed
+from. A re-check (main.py's run_for_all_open_prs) reads this back via
+find_cached_ai_result and passes it to ai_analysis.analyze_pr, which
+skips the model entirely when the fresh fingerprint still matches --
+this is what keeps a push-to-main re-check from re-spending AI calls on
+every open PR whose relevant findings haven't actually changed. This
+keeps the project's "GitHub is the only state store" design: no
+database, just a second invisible comment inside the one Guardian
+already posts. It is not a security boundary -- see CLAUDE.md.
 """
 
 from __future__ import annotations
 
-from guardian.ai_analysis import AIAnalysisOutcome
+import json
+
+from guardian.ai_analysis import AIAnalysisOutcome, AIAnalysisResult
 from guardian.contracts import ContractAnalysis
 from guardian.merge_check import MergeCheckReport, MergeCheckResult
 from guardian.overlap import PROverlap
 
 COMMENT_MARKER = "<!-- pr-guardian:report -->"
 CHECK_RUN_NAME = "PR Guardian"
+
+AI_CACHE_MARKER_PREFIX = "<!-- pr-guardian:ai-cache:"
+AI_CACHE_MARKER_SUFFIX = " -->"
 
 _CATEGORY_LABELS = {
     "database": "Database",
@@ -148,13 +164,52 @@ def _ai_section(outcome: AIAnalysisOutcome | None) -> list[str]:
     return lines
 
 
+def _ai_cache_comment(outcome: AIAnalysisOutcome | None) -> str | None:
+    """The hidden AI-cache marker line for this outcome, or None when
+    there's nothing worth caching (not triggered, unavailable, or no
+    fingerprint). Only a confirmed successful result is ever embedded --
+    an "unavailable" outcome must never look cacheable to the next run."""
+    if outcome is None or outcome.result is None or outcome.fingerprint is None:
+        return None
+    payload = {"fingerprint": outcome.fingerprint, "result": outcome.result.model_dump()}
+    return f"{AI_CACHE_MARKER_PREFIX}{json.dumps(payload, separators=(',', ':'))}{AI_CACHE_MARKER_SUFFIX}"
+
+
+def find_cached_ai_result(comment: dict) -> tuple[str, AIAnalysisResult] | None:
+    """Extract a (fingerprint, AIAnalysisResult) pair embedded by a prior
+    run, for analyze_pr's `cached` parameter. Fails safe: any parse error
+    or shape mismatch (missing marker, malformed JSON, a hand-edited
+    comment) returns None rather than raising -- the caller then just
+    calls the model fresh, which is always the safe direction to fail
+    in."""
+    body = comment.get("body", "")
+    start = body.find(AI_CACHE_MARKER_PREFIX)
+    if start == -1:
+        return None
+    start += len(AI_CACHE_MARKER_PREFIX)
+    end = body.find(AI_CACHE_MARKER_SUFFIX, start)
+    if end == -1:
+        return None
+    try:
+        payload = json.loads(body[start:end])
+        result = AIAnalysisResult(**payload["result"])
+        return payload["fingerprint"], result
+    except Exception:  # noqa: BLE001 - any malformed/tampered cache just means "no cache"
+        return None
+
+
 def build_comment(
     analysis: ContractAnalysis,
     merge_report: MergeCheckReport | None = None,
     overlaps: list[PROverlap] | None = None,
     ai_outcome: AIAnalysisOutcome | None = None,
 ) -> str:
-    lines = [COMMENT_MARKER, "## PR Guardian", ""]
+    lines = [COMMENT_MARKER]
+    cache_line = _ai_cache_comment(ai_outcome)
+    if cache_line:
+        lines.append(cache_line)
+    lines.append("## PR Guardian")
+    lines.append("")
     lines.extend(_contract_section(analysis))
 
     merge_lines = _merge_section(merge_report)
